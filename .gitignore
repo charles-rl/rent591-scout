@@ -1,0 +1,8 @@
+external/
+__pycache__/
+*.pyc
+.venv/
+data/
+models/
+browser_profile/
+.uv/
