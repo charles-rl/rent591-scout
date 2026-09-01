@@ -1,15 +1,23 @@
+import os
 import time
 import uuid
 import warnings
 
 import requests
+from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
+from urllib3.util.retry import Retry
 
 _MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/147.0.0.0 Mobile Safari/537.36"
 )
+
+REQUEST_TIMEOUT = int(os.environ.get("X591_TIMEOUT", "30"))
+# 591's cert is missing Subject Key Identifier; TLS verification is disabled only
+# when explicitly requested (sandbox / firewalled test networks).
+VERIFY_SSL = os.environ.get("RENT591_SSL_VERIFY", "1").lower() not in ("0", "false", "no")
 
 
 class Client591:
@@ -31,9 +39,20 @@ class Client591:
             }
         )
         self._session.cookies.set("T591_TOKEN", self._device_id)
-        # 591's cert is missing Subject Key Identifier; suppress the noise
-        self._session.verify = False
-        warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+        # Backoff + retry on transient failures (429 anti-bot, 5xx, connect errors).
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+        )
+        self._session.mount("https://", HTTPAdapter(max_retries=retry))
+        self._session.verify = VERIFY_SSL
+        if not VERIFY_SSL:
+            warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
     def search_sale(
         self,
@@ -95,7 +114,7 @@ class Client591:
         if keywords is not None:
             params["keywords"] = keywords
 
-        resp = self._session.get(self._SALE_URL, params=params)
+        resp = self._session.get(self._SALE_URL, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -140,7 +159,7 @@ class Client591:
         if keywords is not None:
             params["keywords"] = keywords
 
-        resp = self._session.get(self._RENT_URL, params=params)
+        resp = self._session.get(self._RENT_URL, params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -150,7 +169,7 @@ class Client591:
         Args:
             post_id: Listing ID from search_rent results. e.g. 21044696
         """
-        resp = self._session.get(self._RENT_DETAIL_URL, params={"id": str(post_id)})
+        resp = self._session.get(self._RENT_DETAIL_URL, params={"id": str(post_id)}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -167,7 +186,7 @@ class Client591:
             "id": id_str,
             "device": "touch",
             "device_id": self._device_id,
-        })
+        }, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 

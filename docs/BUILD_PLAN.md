@@ -12,6 +12,7 @@ Execution spec for the Build agent. All paths relative to repo root `/root/rent5
 5. **ntfy `Title` header bug fixed** — `★` (U+2605) is not latin-1 and requests refuses to set the header. Replaced with `(x.x/5)`. Verified payload via a local capture server.
 6. **Sandbox network reality**: 591.com.tw and ntfy.sh are firewall-blocked here (IP-level DROP; only GitHub/PyPI/HF/PyTorch/DockerHub are whitelisted). The nexus proxy is package-registry-only (no general egress). All end-to-end testing uses `--fixtures` (captured 591 responses) + `PLACEHOLDER_IMAGES=1` + a local `NTFY_URL` capture server.
 7. **Live runs honor `HTTPS_PROXY`** automatically (requests `trust_env=True`); pass a real forward proxy to run live from a restricted host.
+8. **DINOv2 → DINOv3 upgrade:** dedup feature extractor moved from `facebook/dinov2-base` to Meta DINOv3 ViT-B/16 (`dinov3-vit-base`). The official HF checkpoint is gated, so the exact-weights conversion of Meta's released `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` (verified: 187/187 tensors mapped, RoPE θ=100 frequency grid matches) is staged under `models/dinov3_cache/facebook_dinov3-vit-base/`. Output contract unchanged: 768-dim float32 CLS embeddings; group-cosine threshold stays 0.95. Verified offline on sample WebP images: 32/32 embedded, all vectors 768-dim float32 L2-normalized; self re-ingestion group sim = 1.0000 (dup detected at 0.95), cross-listing sim in [0, 1); CUDA memory stable across repeated passes.
 
 ## Environment (provisioned)
 - Python 3.12 venv: `.venv/` (uv). Installed: `requests, Pillow, numpy, xgboost, DrissionPage, torch==2.8.0+cu128, torchvision==0.23.0, transformers`.
@@ -29,6 +30,7 @@ Execution spec for the Build agent. All paths relative to repo root `/root/rent5
 - `DB_PATH` (default `data/apartments.db`), `IMAGES_DIR` (default `data/images`)
 - `FIXTURES_DIR` (default `external/mcp-591/tests/fixtures`) — offline mode source
 - `CHROME_BINARY` (optional path override for DrissionPage)
+- `DINOV3_CACHE` (default `models/dinov3_cache`), `DINOV3_MODEL_PATH` (optional local checkpoint dir; default staged `models/dinov3_cache/facebook_dinov3-vit-base`)
 
 ---
 
@@ -53,9 +55,12 @@ Execution spec for the Build agent. All paths relative to repo root `/root/rent5
 - `download_images(listing_id, urls, images_dir) -> list[dict]`: requests GET (timeout 30, verify=False), Pillow open→RGB→`save(…, 'WEBP', quality=85)` to `images_dir/{listing_id}/{ordinal:02d}.webp`; return `[{ordinal, image_url, image_path}]`; tolerate per-image failure.
 - `scraper_fallback(listing_id) -> dict | None`: DrissionPage detail scrape (selectors from `docs/591scraper-analysis.md`), guarded import; return DOM dict or `None` on any failure. (Optional in fixtures mode → `None`.)
 
-## Task 3 — `src/deduplication.py`
-- `Dinov2Extractor` class: loads `facebook/dinov2-base` (`AutoImageProcessor`+`AutoModel`, cache `models/dinov2_cache`) to cuda; `embed(image) -> np.ndarray (768,)` via `[CLS]`, L2-norm in cosine.
-- `embed_images(rows: list[dict], images_dir) -> dict[ordinal, vec]`: open webp → resize 224 → embed. Missing files skipped.
+## Task 3 — `src/deduplication.py` (DINOv3 upgrade)
+- Model: **Meta DINOv3 ViT-B/16** (`dinov3-vit-base`; HF repo `facebook/dinov3-vitb16-pretrain-lvd1689m`, checkpoint hash `73cec8be`). Loaded with `transformers` `AutoModel` + `AutoImageProcessor`; moved to cuda; CLS token → L2-normalized.
+- **Setup & dependencies:** no new packages beyond the existing `torch==2.8.0+cu128`, `transformers` (needs `dinov3_vit` model support, present in installed build), `Pillow`, `numpy`. The official HF repo is gated → stage converted weights locally at `models/dinov3_cache/facebook_dinov3-vit-base/` (`config.json` + `model.safetensors` + `preprocessor_config.json`) so the GPU server runs **offline** after the initial pull.
+- **Caching directory:** `models/dinov3_cache/`. Offline-first resolution: use staged local dir if present, else pull from HF into the same cache (`cache_dir=models/dinov3_cache`). Env overrides: `DINOV3_CACHE`, `DINOV3_MODEL_PATH` (dir path); `HF_HUB_OFFLINE=1` forces offline.
+- `embed_image(path) -> np.ndarray | None`: open webp → processor resize 224 → embed; returns **768-dim float32** L2-normalized `[CLS]`; dimension guard rejects non-768 outputs; failures logged and return `None`.
+- `embed_image_rows(rows: list[dict]) -> dict[ordinal, vec]`: missing files skipped.
 - `cosine(a, b)`, `group_similarity(new_vecs, stored_vecs) -> float` (mean over new of max-over-stored).
 - `find_duplicate(new_vecs, baseline: dict[listing_id, list[vec]], threshold) -> (bool, listing_id)`.
 - `aggregate_embedding(vecs) -> bytes` (mean → float32 BLOB).

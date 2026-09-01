@@ -37,10 +37,10 @@ This system integrates two open-source scraping components:
                                        │
                                        ▼
                      ┌───────────────────────────────────┐
-                     │ 2. Deduplication & Active Check   │
-                     │    - HTTP 200 / Active status     │
-                     │    - DINOv2 Cosine Similarity     │
-                     │      (Group Avg Match >= 0.95)   │
+                      │ 2. Deduplication & Active Check   │
+                      │    - HTTP 200 / Active status     │
+                      │    - DINOv3 Cosine Similarity     │
+                      │      (Group Avg Match >= 0.95)   │
                      └─────────────────┬─────────────────┘
                                        │ (If unique & active)
                                        ▼
@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS dynamic_preferences (
 ### Image Storage Pipeline (standardized)
 - Fetch original-resolution images by stripping the 591 CDN resize suffix (e.g. `!510x400.jpg`) from `photoList`.
 - Re-encode every downloaded image to **WebP, quality=85** (Pillow) and store at `data/images/{listing_id}/{ordinal:02d}.webp`.
-- WebP q85 keeps ~visual fidelity for Qwen-VL analysis and DINOv2 feature extraction while cutting disk usage roughly 40–70% vs JPEG originals.
+- WebP q85 keeps ~visual fidelity for Qwen-VL analysis and DINOv3 feature extraction while cutting disk usage roughly 40–70% vs JPEG originals.
 - Per-image download/encode failures are non-fatal; the listing is still stored with whatever images succeeded.
 
 ---
@@ -218,9 +218,65 @@ def fetch_raw_listings():
 
 ---
 
-### Component 2: Active Check & Multi-Image DINO Deduplication
+### Component 2: Active Check & Multi-Image DINOv3 Deduplication
 
 Before executing expensive visual LLM passes, verify listing availability and perform set-based cosine similarity on image embeddings to skip re-uploaded or duplicate properties.
+
+#### Feature Extractor: Meta DINOv3 (`dinov3-vit-base`)
+
+The extractor is upgraded from `facebook/dinov2-base` (DINOv2) to **Meta DINOv3 ViT-B/16**
+(`dinov3-vit-base`, self-supervised LVD-1689M pretraining). Loading via Hugging Face
+`transformers` (`AutoModel` / `AutoImageProcessor`) keeps the downstream contract intact:
+the CLS token is still a **768-dimensional float32** vector, so XGBoost feature
+concatenation and the SQLite BLOB schema are unchanged.
+
+```python
+import os
+from pathlib import Path
+from transformers import AutoImageProcessor, AutoModel
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CACHE = ROOT / "models" / "dinov3_cache"   # offline weight cache (GPU server)
+HUB_REPO_ID = "facebook/dinov3-vitb16-pretrain-lvd1689m"  # DINOv3 ViT-B/16
+
+_MODEL = None
+_PROCESSOR = None
+
+def load_dinov3():
+    """Offline-first: use staged weights under models/dinov3_cache/, else pull from HF."""
+    global _MODEL, _PROCESSOR
+    if _MODEL is not None:
+        return _MODEL, _PROCESSOR
+    local = Path(os.environ.get("DINOV3_MODEL_PATH", str(DEFAULT_CACHE / "facebook_dinov3-vit-base")))
+    source, kwargs = (str(local), {}) if (local / "config.json").is_file() else \
+                     (HUB_REPO_ID, {"cache_dir": str(DEFAULT_CACHE)})
+    _PROCESSOR = AutoImageProcessor.from_pretrained(source, **kwargs)
+    _MODEL = AutoModel.from_pretrained(source, **kwargs)
+    _MODEL.eval().cuda()  # fp32 on GPU; L2-normalized CLS in embed step
+
+def embed_dinov3(image_path):
+    """768-dim float32 L2-normalized CLS embedding for one image."""
+    import torch, numpy as np
+    from PIL import Image
+    model, processor = load_dinov3()
+    img = Image.open(image_path).convert("RGB")
+    inputs = {k: v.cuda() for k, v in processor(images=[img], return_tensors="pt").items()}
+    with torch.no_grad():
+        vec = model(**inputs).last_hidden_state[:, 0].cpu().numpy().astype(np.float32)
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else None
+```
+
+**Why DINOv3 over DINOv2:**
+
+- **RoPE positional embeddings** replace learnable absolute positions — resolution-independent
+  attention with higher spatial detail recognition (exact fixture/room placement matters when
+  deciding whether two photos show the same bathroom).
+- **Register tokens + improved dense patch features** — better preservation of fine texture and
+  layout cues across bathroom/layout photos, which sharpens the per-image cosine signal that the
+  group-average dedup formula consumes.
+- **Same vector contract** — ViT-B/16 still emits a 768-dim CLS embedding; only feature quality
+  improves, so no schema or XGBoost-head changes are required.
 
 #### Group Cosine Similarity Formula
 
@@ -296,7 +352,7 @@ def construct_full_prompt(sqlite_conn):
 ### Component 4: Scoring Engine (Cold-Start & XGBoost)
 
 * **Cold-Start Phase ($\le 20$ Labeled Samples):** Set `predicted_score = qwen_direct_score`.
-* **Supervised Phase ($> 20$ Labeled Samples):** Train an XGBoost classifier/regressor using the 768-dimensional DINO multi-photo feature vector concatenated with binary Qwen metadata flags.
+* **Supervised Phase ($> 20$ Labeled Samples):** Train an XGBoost classifier/regressor using the 768-dimensional DINOv3 multi-photo feature vector concatenated with binary Qwen metadata flags.
 * **Unsupervised Feature Learning:** Store all unrated listing embeddings in SQLite for dimensionality reduction (PCA/UMAP) and cluster feature analysis.
 
 ```python
@@ -432,7 +488,8 @@ When creating the repository, follow this folder layout:
 │   └── apartments.db            # SQLite primary database
 ├── models/
 │   ├── xgboost_head.json        # Saved XGBoost weights
-│   └── dinov2_cache/            # Local DINOv2 model weights
+│   └── dinov3_cache/            # Local DINOv3 model weights (offline)
+│       └── facebook_dinov3-vit-base/  # config.json + model.safetensors (ViT-B/16)
 ├── src/
 │   ├── __init__.py
 │   ├── database.py              # SQLite connection, DDL, upserts
@@ -457,7 +514,7 @@ When creating the repository, follow this folder layout:
 
 1. **Query:** Run `ingestion.fetch_raw_listings()` to collect recent active listings.
 2. **Filter Dead Links:** Validate `HTTP 200` status and verify non-expired listing text.
-3. **Deduplicate:** Generate DINOv2 vectors for listing photos; evaluate group cosine similarity against SQLite database ($>0.95$ threshold drops listing).
+3. **Deduplicate:** Generate DINOv3 (ViT-B/16) CLS vectors for listing photos from `models/dinov3_cache` (offline after initial pull); evaluate group cosine similarity against SQLite database ($>0.95$ threshold drops listing).
 4. **LLM Inference:** Pass photos and Chinese text to local Qwen 27B Vision API with Base + Dynamic system prompt.
 5. **Predict:** Compute score using Qwen direct rating (if $\le 20$ ratings exist) or XGBoost regressor (if $> 20$ ratings exist).
 6. **Notify:** If predicted score $\ge 3.5$, trigger `ntfy.sh` push notification with listing URL and warning highlights.

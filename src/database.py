@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS listings (
     browse_count INTEGER, refresh_time TEXT,
     tags JSON, contain_cost JSON,
     raw_search JSON, raw_metadata JSON, scraper_raw JSON,
+    social_house BOOLEAN, facilities JSON,
     description TEXT,
     image_urls JSON, image_paths JSON,
     qwen_warnings JSON, qwen_vision_flags JSON, qwen_direct_score REAL,
@@ -65,8 +66,23 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
     conn.commit()
     return conn
+
+
+_EXTRA_COLUMNS = [
+    ("social_house", "BOOLEAN"),
+    ("facilities", "JSON"),
+]
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add columns introduced after the initial schema (migration)."""
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    for name, decl in _EXTRA_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
 
 
 def _json(value):
@@ -80,17 +96,21 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "community_name", "community_id", "layout", "area", "floor", "shape", "kind_name",
         "deposit", "rent_per", "rent_per_unit", "browse_count", "refresh_time",
         "tags", "contain_cost", "raw_search", "raw_metadata", "scraper_raw",
+        "social_house", "facilities",
         "description", "image_urls", "image_paths",
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score",
         "dino_embedding", "predicted_score", "score_source",
     ]
     placeholders = ", ".join(f":{c}" for c in cols)
-    sets = ", ".join(f"{c}=excluded.{c}" for c in cols)
+    # COALESCE keeps previously stored values when this run's payload is degraded
+    # (e.g. detail fetch failed), preventing NULL-wipe of lat/tags/scores.
+    sets = ", ".join(f"{c}=COALESCE(excluded.{c}, listings.{c})" for c in cols)
     sql = f"INSERT INTO listings ({', '.join(cols)}) VALUES ({placeholders}) " \
           f"ON CONFLICT(listing_id) DO UPDATE SET updated_at=CURRENT_TIMESTAMP, {sets}"
     row = {c: listing.get(c) for c in cols}
     for j in ("tags", "contain_cost", "raw_search", "raw_metadata", "scraper_raw",
-              "qwen_warnings", "qwen_vision_flags", "image_urls", "image_paths"):
+              "qwen_warnings", "qwen_vision_flags", "image_urls", "image_paths",
+              "facilities"):
         if row.get(j) is not None and not isinstance(row[j], str):
             row[j] = _json(row[j])
     conn.execute(sql, row)

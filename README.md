@@ -2,7 +2,7 @@
 
 Automated, Active Learning-driven rental monitor for Rent591 (`rent.591.com.tw`).
 Combines API ingestion (mcp-591), browser fallback scraping (591scraper), local
-DINOv2 image embeddings for deduplication, a local Qwen 27B vision LLM (Ollama),
+DINOv3 image embeddings for deduplication, a local Qwen 27B vision LLM (Ollama),
 an XGBoost scoring head, and ntfy.sh push notifications.
 
 ## Architecture
@@ -10,7 +10,7 @@ an XGBoost scoring head, and ntfy.sh push notifications.
 ```
 Ingestion (mcp-591 API → 591scraper DOM fallback)
    → WebP images (quality=85)
-   → DINOv2 group-cosine dedup (≥0.95)
+    → DINOv3 group-cosine dedup (≥0.95, 768-dim ViT-B/16 CLS embeddings from models/dinov3_cache, offline-capable)
    → Qwen 27B vision + text JSON analysis (Base + Dynamic prompt)
    → Score (Qwen direct ≤20 ratings | XGBoost >20 ratings)
    → ntfy.sh push if score ≥ 3.5
@@ -50,6 +50,9 @@ python rate.py --id 21103645 --score 4 --bathroom 4 --comment "dry-wet separatio
 - Live runs honor `HTTPS_PROXY`/`HTTP_PROXY` automatically (requests `trust_env=True`).
   On a restricted host, export a forward proxy that can reach 591 before running.
 - DrissionPage is non-commercial licensed. See `docs/` for full analysis.
-- Verified: full pipeline passes end-to-end in fixtures mode on GPU (DINOv2 + Qwen
+- **DINOv3 dedup:** feature extraction uses Meta DINOv3 ViT-B/16 (`dinov3-vit-base`). Weights are cached under
+  `models/dinov3_cache/` (offline after initial pull; set `HF_HUB_OFFLINE=1` to force). The extractor emits
+  768-dim float32 L2-normalized CLS embeddings, keeping the XGBoost concat and SQLite BLOB schema unchanged.
+- Verified: full pipeline passes end-to-end in fixtures mode on GPU (DINOv3 + Qwen
   vision + cold-start/XGBoost scoring); ntfy payload validated via local capture
   (Title header is ASCII `(x.x/5)` — a `★` in the header breaks latin-1 encoding).

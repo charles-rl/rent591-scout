@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "rent591-scout")
 NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh")
@@ -26,5 +29,5 @@ def send_ntfy_alert(listing: dict, predicted_score: float, threshold: float = 3.
         resp.raise_for_status()
         return True
     except Exception as e:
-        print(f"[notifier] ntfy push failed: {e}")
+        logger.warning("ntfy push failed: %s", e)
         return False

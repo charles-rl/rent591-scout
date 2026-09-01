@@ -48,7 +48,7 @@ payload plus a small set of denormalized canonical columns for fast querying.
 3. `description` = `remark.content` (API) with fallback to scraper `desc`.
 4. Images: primary `photoList` (strip `!resize` suffix → original), fallback `cover`/`meta.ogimage`/`favData.thumb`. **No images from scraper**.
 5. Canonical denormalized columns (price, layout, area, floor, address, lat/lng, community, tags, etc.) derived API-first, scraper-fallback where the API lacks them.
-6. All image derivatives (WebP paths, per-image DINOv2 vectors) live in the `listing_images` table keyed by `listing_id`.
+6. All image derivatives (WebP paths, per-image DINOv3 768-dim CLS vectors) live in the `listing_images` table keyed by `listing_id`.
 
 ## Unified schema
 
@@ -101,11 +101,11 @@ CREATE TABLE IF NOT EXISTS dynamic_preferences (
 ## Image storage directive
 - Download originals (resize suffix stripped).
 - Re-encode to **WebP, quality=85** (Pillow) → `data/images/{listing_id}/{ordinal:02d}.webp`.
-- Rationale: ~40-70% smaller than JPEG originals at equivalent fidelity; optimal for Qwen-VL tokenization and DINOv2 feature extraction.
+- Rationale: ~40-70% smaller than JPEG originals at equivalent fidelity; optimal for Qwen-VL tokenization and DINOv3 feature extraction (RoPE + register-token dense features read fine from q85 WebP).
 - On download/encode failure: record empty `image_path`, do not abort the listing.
 
 ### Verified constraint (Ollama + WebP)
 - **Ollama cannot ingest WebP** (400 "Failed to load image or audio file"). WebP stays on disk
-  (disk savings + DINOv2 reads it fine via Pillow), but `src/vision_llm._image_b64` transcodes to
+  (disk savings + DINOv3 reads it fine via Pillow), but `src/vision_llm._image_b64` transcodes to
   **PNG in-memory** before base64-encoding for the `/api/chat` `images` array. No schema change needed
   (`image_path` remains `.webp`).

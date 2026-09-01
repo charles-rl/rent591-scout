@@ -10,10 +10,13 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import re
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get(
@@ -59,9 +62,13 @@ def construct_full_prompt(bullets: str | None) -> str:
 
 def _image_b64(path: str) -> str:
     from PIL import Image
-    img = Image.open(path).convert("RGB")
+    with Image.open(path) as raw:
+        img = raw.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, "PNG")
+    try:
+        img.save(buf, "PNG")
+    finally:
+        img.close()
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -75,6 +82,10 @@ def build_messages(listing: dict, image_paths: list[str], bullets: str | None) -
         "shape": listing.get("shape", ""),
         "tags": listing.get("tags", []),
         "contain_cost": listing.get("contain_cost", []),
+        "facilities": listing.get("facilities", []),
+        "social_house": listing.get("social_house"),
+        "deposit": listing.get("deposit", ""),
+        "rent_per": listing.get("rent_per"),
     }
     text = (
         "Analyze this Rent591 rental listing. Return the JSON object.\n"
@@ -159,7 +170,7 @@ def analyze_listing(listing: dict, image_rows: list[dict], bullets: str | None) 
             "qwen_direct_score": _clean_score(data.get("predicted_score", 3.0)),
         }
     except Exception as e:
-        print(f"[vision_llm] analyze failed: {e}")
+        logger.warning("analyze failed: %s", e)
         return None
 
 
@@ -187,5 +198,5 @@ Return ONLY the bulleted list, one bullet per line starting with "-".
             lines = [ln.strip() for ln in raw.splitlines() if ln.strip()][:7]
         return "\n".join(f"- {ln}" for ln in lines[:7]) if lines else (current_bullets or "")
     except Exception as e:
-        print(f"[vision_llm] consolidate failed: {e}")
+        logger.warning("consolidate failed: %s", e)
         return current_bullets or ""

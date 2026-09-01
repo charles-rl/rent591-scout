@@ -6,25 +6,43 @@ Supports an offline `--fixtures` mode replaying captured 591 responses for testi
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import logging
 import os
+import random
 import re
+import time
 from pathlib import Path
 
 import requests
 from PIL import Image
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .client591 import Client591
 from .constants591 import REGIONS, RENT_KINDS, SECTIONS, SECTIONS_BY_REGION
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(os.environ.get("FIXTURES_DIR", ROOT / "external" / "mcp-591" / "tests" / "fixtures"))
 IMAGES_DIR = Path(os.environ.get("IMAGES_DIR", ROOT / "data" / "images"))
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+VERIFY_SSL = os.environ.get("RENT591_SSL_VERIFY", "1").lower() not in ("0", "false", "no")
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": _UA})
+_SESSION.verify = VERIFY_SSL
+_IMAGE_RETRY = Retry(
+    total=2, connect=2, read=2, status=2, backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset({"GET"}),
+)
+_SESSION.mount("https://", HTTPAdapter(max_retries=_IMAGE_RETRY))
 
 
 # --------------------------------------------------------------------------
@@ -84,7 +102,12 @@ def fetch_raw_listings(fixtures: bool = False, limit: int = -1) -> list[dict]:
         if not page_items:
             break
         next_row = data.get("firstRow")
-        if not isinstance(next_row, int) or next_row == first_row:
+        try:
+            next_row = int(next_row)
+        except (TypeError, ValueError):
+            logger.warning("unexpected firstRow=%r; stopping pagination", data.get("firstRow"))
+            break
+        if next_row == first_row:
             break
         first_row = next_row
 
@@ -92,15 +115,19 @@ def fetch_raw_listings(fixtures: bool = False, limit: int = -1) -> list[dict]:
     for item in items:
         pid = str(item.get("id"))
         meta = None
+        detail_failed = False
         try:
             resp = client.get_rent_detail(pid)
             d = resp.get("data")
             meta = d if isinstance(d, dict) and d else None
-        except Exception:
-            meta = None
-        out.append({"raw_search": item, "raw_metadata": meta})
+        except Exception as e:
+            detail_failed = True
+            logger.warning("detail fetch failed for %s: %s", pid, e)
+        out.append({"raw_search": item, "raw_metadata": meta, "detail_failed": detail_failed})
         if limit > 0 and len(out) >= limit:
             break
+        if not detail_failed:
+            time.sleep(random.uniform(0.5, 2.0))
     return out
 
 
@@ -113,8 +140,9 @@ def _fetch_from_fixtures(limit: int) -> list[dict]:
     fixture_id = str(items[0]["id"]) if items else None
     out = []
     for i, item in enumerate(items):
-        meta = detail if fixture_id and str(item["id"]) == fixture_id else None
-        out.append({"raw_search": item, "raw_metadata": meta})
+        has_detail = fixture_id and str(item["id"]) == fixture_id
+        meta = detail if has_detail else None
+        out.append({"raw_search": item, "raw_metadata": meta, "detail_failed": not has_detail})
         if limit > 0 and len(out) >= limit:
             break
     return out
@@ -132,11 +160,28 @@ def _int_price(raw: str | int | None) -> int:
     return int(m.group(0).replace(",", "")) if m else 0
 
 
+def _float_price(raw: str | int | float | None) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not raw:
+        return None
+    m = re.search(r"\d[\d.,]*", str(raw))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def _info_map(data: dict) -> dict:
     return {x.get("key"): x.get("value") for x in data.get("info", [])}
 
 
-def normalize_listing(raw_search: dict, raw_metadata: dict | None) -> dict:
+def normalize_listing(raw_search: dict, raw_metadata: dict | None,
+                      detail_failed: bool = False) -> dict:
     item = raw_search or {}
     data = raw_metadata or {}
     info = _info_map(data)
@@ -144,15 +189,18 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None) -> dict:
     addr = data.get("address", {}) or {}
     cost = {x.get("key"): x.get("value") for x in (data.get("cost") or {}).get("data", [])}
 
-    pid = str(item.get("id") or gtm.get("item_id", "").lstrip("R"))
+    raw_id = item.get("id")
+    pid = str(raw_id) if raw_id is not None else str(gtm.get("item_id", "")).removeprefix("R")
     title = item.get("title") or data.get("title") or ""
     price = _int_price(item.get("price") or data.get("price"))
     lat = None
     lng = None
     if addr.get("lat"):
         lat, lng = float(addr["lat"]), float(addr["lng"])
-    elif data.get("lat") is not None:
-        lat, lng = float(data["lat"]), float(data["lng"])
+    else:
+        pos = data.get("positionRound") or {}
+        if pos.get("lat") is not None:
+            lat, lng = float(pos["lat"]), float(pos["lng"])
 
     area_raw = item.get("area") or info.get("area")
     area = None
@@ -165,9 +213,29 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None) -> dict:
 
     description = (data.get("remark") or {}).get("content") or ""
     contain = data.get("containCost") or []
-    tags = [t.get("value") if isinstance(t, dict) else t for t in (item.get("tags") or [])]
-    if not tags and isinstance(data.get("tags"), list):
-        tags = [t.get("value", "") for t in data["tags"] if isinstance(t, dict)]
+    item_tags = [t.get("value") if isinstance(t, dict) else t for t in (item.get("tags") or [])]
+    detail_tags = []
+    if isinstance(data.get("tags"), list):
+        detail_tags = [t.get("value", "") for t in data["tags"] if isinstance(t, dict)]
+    tags = list(dict.fromkeys(str(t).strip() for t in item_tags + detail_tags if t))
+
+    facility = data.get("service") or {}
+    facilities = [
+        f.get("name") for f in facility.get("facility", [])
+        if isinstance(f, dict) and f.get("active")
+    ]
+    social_house = item.get("social_house") or (data.get("favData") or {}).get("socialHouse")
+    social_house = bool(int(social_house)) if isinstance(social_house, (int, str)) else None
+
+    if data:
+        status = data.get("status") or "open"
+        active = True
+    elif detail_failed:
+        status = None  # unknown — network/rate-limit failure, not evidence of delisting
+        active = True  # keep processing; COALESCE preserves previously stored values
+    else:
+        status = "closed"
+        active = False
 
     return {
         "listing_id": pid,
@@ -175,8 +243,8 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None) -> dict:
         "price": price,
         "price_unit": item.get("price_unit") or data.get("priceUnit") or "元/月",
         "url": f"https://rent.591.com.tw/{pid}",
-        "status": data.get("status") if data else None,
-        "is_active": bool(data),
+        "status": status,
+        "is_active": active,
         "region": gtm.get("region_name") or (REGIONS.get(item.get("regionid")) if item.get("regionid") else None),
         "section": gtm.get("section_name"),
         "address": addr.get("data") or item.get("address") or "",
@@ -190,12 +258,14 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None) -> dict:
         "shape": info.get("shape"),
         "kind_name": item.get("kind_name") or gtm.get("kind_name"),
         "deposit": data.get("deposit") or cost.get("deposit") or "",
-        "rent_per": _int_price(item.get("price_per")) or None,
+        "rent_per": _float_price(item.get("price_per")),
         "rent_per_unit": item.get("price_per_unit") or "元/坪/月",
         "browse_count": item.get("browse_count"),
         "refresh_time": item.get("refresh_time") or (data.get("publish") or {}).get("postTime"),
         "tags": tags,
         "contain_cost": contain,
+        "social_house": social_house,
+        "facilities": facilities,
         "description": description or "",
         "raw_search": item,
         "raw_metadata": data,
@@ -210,9 +280,14 @@ def fetch_image_urls(raw_search: dict, raw_metadata: dict | None) -> list[str]:
         meta = raw_metadata.get("meta", {}) or {}
         fav = (raw_metadata.get("favData") or {}).get("thumb")
         for u in (raw_metadata.get("cover"), meta.get("ogimage"), fav):
-            if u and u not in urls:
+            if u:
                 urls.append(u)
-    return [_strip_suffix(u) for u in urls]
+    seen: list[str] = []
+    for u in urls:
+        s = _strip_suffix(u)
+        if s and s not in seen:
+            seen.append(s)
+    return seen
 
 
 def _strip_suffix(url: str) -> str:
@@ -221,11 +296,26 @@ def _strip_suffix(url: str) -> str:
     return url
 
 
+def _valid_webp(path: Path) -> bool:
+    """Reject zero-byte / truncated cache files so they get re-downloaded."""
+    try:
+        if path.stat().st_size == 0:
+            return False
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
 def download_images(listing_id: str, urls: list[str], placeholder: bool = False) -> list[dict]:
     """Download originals, re-encode to WebP quality=85, return image row dicts.
 
     When placeholder=True (offline fixtures testing), generate solid-color WebP
     placeholders instead of fetching from the blocked 591 CDN.
+
+    Rows are appended for every ordinal (failed downloads carry image_path=None)
+    so image_urls/image_paths/listing_images stay aligned (data-maxification.md:105).
     """
     if not urls:
         return []
@@ -233,22 +323,28 @@ def download_images(listing_id: str, urls: list[str], placeholder: bool = False)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     for ordinal, url in enumerate(urls):
-        ext = ".webp"
-        path = out_dir / f"{ordinal:02d}{ext}"
+        path = out_dir / f"{ordinal:02d}.webp"
         try:
-            if not path.exists():
+            if not path.exists() or not _valid_webp(path):
                 if placeholder:
-                    import hashlib
                     color = int(hashlib.md5(f"{listing_id}:{ordinal}".encode()).hexdigest()[:6], 16)
                     img = Image.new("RGB", (800, 600), (color >> 16 & 255, color >> 8 & 255, color & 255))
                 else:
-                    resp = _SESSION.get(url, timeout=30, verify=False)
+                    resp = _SESSION.get(url, timeout=30)
                     resp.raise_for_status()
-                    img = Image.open(__import__("io").BytesIO(resp.content)).convert("RGB")
-                img.save(path, "WEBP", quality=85)
+                    if "image" not in (resp.headers.get("content-type", "") or "").lower():
+                        raise ValueError(f"unexpected content-type: {resp.headers.get('content-type')}")
+                    if len(resp.content) > MAX_IMAGE_BYTES:
+                        raise ValueError(f"payload too large: {len(resp.content)} bytes")
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                try:
+                    img.save(path, "WEBP", quality=85)
+                finally:
+                    img.close()
             rows.append({"ordinal": ordinal, "image_url": url, "image_path": str(path)})
         except Exception as e:
-            print(f"[ingestion] image {ordinal} for {listing_id} failed: {e}")
+            logger.warning("image %s for %s failed: %s", ordinal, listing_id, e)
+            rows.append({"ordinal": ordinal, "image_url": url, "image_path": None})
     return rows
 
 
@@ -315,7 +411,7 @@ def scraper_fallback(listing_id: str) -> dict | None:
             except Exception:
                 pass
     except Exception as e:
-        print(f"[ingestion] scraper fallback {listing_id} failed: {e}")
+        logger.warning("scraper fallback %s failed: %s", listing_id, e)
         return None
 
 
@@ -340,4 +436,18 @@ def apply_scraper(listing: dict, scraper: dict | None) -> dict:
         listing["price"] = scraper.get("price", 0)
     if not listing.get("community_name"):
         listing["community_name"] = scraper.get("社區", "")
+    fac = list(listing.get("facilities") or [])
+    if scraper.get("提供設備"):
+        for item in str(scraper["提供設備"]).replace("，", ",").split(","):
+            item = item.strip()
+            if item and item not in fac:
+                fac.append(item)
+    pet = scraper.get("養寵物")
+    if pet == "Yes" and "可養寵物" not in fac:
+        fac.append("可養寵物")
+    elif pet == "No" and "不可養寵物" not in fac:
+        fac.append("不可養寵物")
+    listing["facilities"] = fac
+    if not listing.get("contain_cost") and scraper.get("租金含"):
+        listing["contain_cost"] = [scraper["租金含"]]
     return listing

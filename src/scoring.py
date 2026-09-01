@@ -7,6 +7,7 @@ Phase 2 (>RATED_THRESHOLD): XGBRegressor over [DINO 768-d embedding; binary flag
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -15,8 +16,11 @@ import xgboost as xgb
 
 from . import database
 
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parent.parent
 RATED_THRESHOLD = int(os.environ.get("RATED_THRESHOLD", "20"))
-MODEL_PATH = Path(os.environ.get("XGB_MODEL_PATH", "models/xgboost_head.json"))
+MODEL_PATH = Path(os.environ.get("XGB_MODEL_PATH", str(ROOT / "models" / "xgboost_head.json")))
 _FLAG_ORDER = ["has_bathroom_img", "shower_sink_combo", "drainage_risk", "has_kitchen_sink", "has_exterior_window"]
 
 
@@ -65,4 +69,4 @@ def train_and_save(conn) -> None:
     model.fit(np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32))
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(str(MODEL_PATH))
-    print(f"[scoring] trained and saved {MODEL_PATH} on {len(y)} rated samples")
+    logger.info("trained and saved %s on %d rated samples", MODEL_PATH, len(y))

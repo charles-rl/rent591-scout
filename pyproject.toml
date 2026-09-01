@@ -1,0 +1,27 @@
+[project]
+name = "rent591-scout"
+version = "0.1.0"
+description = "Rent591 rental scout: mcp-591 ingestion + 591scraper fallback + DINOv3 dedup + Qwen vision + XGBoost scoring"
+requires-python = ">=3.12"
+dependencies = [
+    "Pillow>=12.0",
+    "requests>=2.32",
+    "numpy>=2.0",
+    "torch>=2.4",
+    "transformers>=4.45",
+    "xgboost>=2.1",
+    "DrissionPage>=4.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
