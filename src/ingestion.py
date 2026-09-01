@@ -38,7 +38,13 @@ VERIFY_SSL = os.environ.get("RENT591_SSL_VERIFY", "1").lower() not in ("0", "fal
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 
 _SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": _UA})
+_SESSION.headers.update({
+    "User-Agent": _UA,
+    # img1/img2.591.com.tw enforce hotlink protection: image GETs need the site referer.
+    "Referer": "https://rent.591.com.tw/",
+    "Accept": "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+})
 _SESSION.verify = VERIFY_SSL
 _IMAGE_RETRY = Retry(
     total=2, connect=2, read=2, status=2, backoff_factor=0.5,
