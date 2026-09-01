@@ -2,7 +2,8 @@ external/
 __pycache__/
 *.pyc
 .venv/
-data/
+data/*
+!data/incoming/
 models/
 browser_profile/
 .uv/

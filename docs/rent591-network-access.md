@@ -95,6 +95,13 @@ real captured 591 responses in fixtures mode).
 
 ## What works instead
 
+1. **GitHub Actions cron relay** (implemented — the production path): a scheduled
+   workflow (`.github/workflows/scrape_relay.yml`) runs `python -m src.ingestion
+   --output-dir data/incoming/` on GitHub's cloud runners (591-reachable), commits raw
+   JSON payloads + WebP images back to this repo, and the GPU server `git pull`s them
+   and runs `python main.py --incoming` fully offline. See the README "GitHub Actions
+   cron relay" section.
+
 1. **Offline fixtures mode** (used for all end-to-end testing here):
    ```bash
    PLACEHOLDER_IMAGES=1 python main.py --fixtures --limit 3

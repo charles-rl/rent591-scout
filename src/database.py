@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS dynamic_preferences (
     prompt_bullet_list TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS relay_state (
+    listing_id     TEXT PRIMARY KEY,
+    payload_sha256 TEXT,
+    processed_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -170,3 +176,23 @@ def rate_listing(conn: sqlite3.Connection, listing_id: str, score: float,
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# GitHub relay processing state (avoids re-processing unchanged payloads)
+# ---------------------------------------------------------------------------
+def relay_is_processed(conn: sqlite3.Connection, listing_id: str, payload_sha256: str | None) -> bool:
+    row = conn.execute(
+        "SELECT payload_sha256 FROM relay_state WHERE listing_id=?", (listing_id,)
+    ).fetchone()
+    return bool(row) and row[0] is not None and row[0] == payload_sha256
+
+
+def mark_relay_processed(conn: sqlite3.Connection, listing_id: str, payload_sha256: str | None) -> None:
+    conn.execute(
+        "INSERT INTO relay_state (listing_id, payload_sha256) VALUES (?,?) "
+        "ON CONFLICT(listing_id) DO UPDATE SET payload_sha256=excluded.payload_sha256, "
+        "processed_at=CURRENT_TIMESTAMP",
+        (listing_id, payload_sha256),
+    )
+    conn.commit()

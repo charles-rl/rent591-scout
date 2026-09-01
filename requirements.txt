@@ -1,0 +1,5 @@
+# GitHub Actions relay runner deps (scrape_relay.yml) — scraper + image re-encode only.
+# Heavy GPU/inference deps (torch, transformers, xgboost, DrissionPage) live in
+# pyproject.toml and are NOT needed on the runner.
+requests>=2.32
+Pillow>=12.0

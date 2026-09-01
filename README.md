@@ -17,6 +17,30 @@ Ingestion (mcp-591 API → 591scraper DOM fallback)
    → SQLite storage + CLI feedback → dynamic preference prompt retrain
 ```
 
+### GitHub Actions cron relay (firewall workaround)
+
+The GPU server's egress firewall blocks `rent.591.com.tw` / `bff-house.591.com.tw` /
+`ntfy.sh` but whitelists `github.com`. Scraping is therefore offloaded to GitHub's
+cloud runners (`.github/workflows/scrape_relay.yml`, every 30 min + manual dispatch):
+
+```
+GitHub runner (can reach 591)                    GPU server (591 blocked)
+  python -m src.ingestion --output-dir data/incoming/
+    raw JSON payloads + WebP images
+  git commit + push  ────────────────────────────▶  git pull
+                                                    python main.py --incoming
+                                                      DINOv3 dedup (local)
+                                                      Qwen vision (Ollama)
+                                                      XGBoost score + SQLite
+```
+
+Payloads land in `data/incoming/listings/<id>.json` + `data/incoming/images/<id>/*.webp`
+(shipped in-git; `.gitignore` un-ignores `data/incoming/`). Per-listing `payload_sha256`
+plus a `relay_state` table make both sides idempotent: the runner skips unchanged
+payloads (no commit churn), the server skips already-processed hashes. `--incoming`
+makes **zero** outbound calls to 591/CDN/ntfy (verified with `HTTPS_PROXY` pointed at a
+blackhole); notifications are off by default in this mode.
+
 ## Setup
 
 ```bash
@@ -35,9 +59,13 @@ Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=`,
 
 ```bash
 python main.py                    # live run
+python main.py --incoming         # offline run over GitHub relay payloads (data/incoming/)
 python main.py --fixtures --limit 3   # offline test with captured fixtures
 python main.py --train            # train XGBoost head from rated rows
 python rate.py --id 21103645 --score 4 --bathroom 4 --comment "dry-wet separation preferred"
+
+# manual relay trigger (needs gh / repo token):
+gh workflow run scrape_relay.yml
 ```
 
 ## Notes

@@ -13,7 +13,10 @@ import logging
 import os
 import random
 import re
+import sys
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -308,6 +311,25 @@ def _valid_webp(path: Path) -> bool:
         return False
 
 
+def _grab_webp(url: str, dest: Path, placeholder: bool = False, key: str = "") -> None:
+    """Fetch url (or synthesize a solid-color WebP when placeholder=True), save at q=85."""
+    if placeholder:
+        color = int(hashlib.md5(key.encode()).hexdigest()[:6], 16)
+        img = Image.new("RGB", (800, 600), (color >> 16 & 255, color >> 8 & 255, color & 255))
+    else:
+        resp = _SESSION.get(url, timeout=30)
+        resp.raise_for_status()
+        if "image" not in (resp.headers.get("content-type", "") or "").lower():
+            raise ValueError(f"unexpected content-type: {resp.headers.get('content-type')}")
+        if len(resp.content) > MAX_IMAGE_BYTES:
+            raise ValueError(f"payload too large: {len(resp.content)} bytes")
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+    try:
+        img.save(dest, "WEBP", quality=85)
+    finally:
+        img.close()
+
+
 def download_images(listing_id: str, urls: list[str], placeholder: bool = False) -> list[dict]:
     """Download originals, re-encode to WebP quality=85, return image row dicts.
 
@@ -326,21 +348,7 @@ def download_images(listing_id: str, urls: list[str], placeholder: bool = False)
         path = out_dir / f"{ordinal:02d}.webp"
         try:
             if not path.exists() or not _valid_webp(path):
-                if placeholder:
-                    color = int(hashlib.md5(f"{listing_id}:{ordinal}".encode()).hexdigest()[:6], 16)
-                    img = Image.new("RGB", (800, 600), (color >> 16 & 255, color >> 8 & 255, color & 255))
-                else:
-                    resp = _SESSION.get(url, timeout=30)
-                    resp.raise_for_status()
-                    if "image" not in (resp.headers.get("content-type", "") or "").lower():
-                        raise ValueError(f"unexpected content-type: {resp.headers.get('content-type')}")
-                    if len(resp.content) > MAX_IMAGE_BYTES:
-                        raise ValueError(f"payload too large: {len(resp.content)} bytes")
-                    img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                try:
-                    img.save(path, "WEBP", quality=85)
-                finally:
-                    img.close()
+                _grab_webp(url, path, placeholder=placeholder, key=f"{listing_id}:{ordinal}")
             rows.append({"ordinal": ordinal, "image_url": url, "image_path": str(path)})
         except Exception as e:
             logger.warning("image %s for %s failed: %s", ordinal, listing_id, e)
@@ -451,3 +459,104 @@ def apply_scraper(listing: dict, scraper: dict | None) -> dict:
     if not listing.get("contain_cost") and scraper.get("租金含"):
         listing["contain_cost"] = [scraper["租金含"]]
     return listing
+
+
+# --------------------------------------------------------------------------
+# GitHub Actions cron relay: dump raw payloads + WebP images to data/incoming/
+# --------------------------------------------------------------------------
+# The GPU server cannot reach rent.591.com.tw / ntfy.sh (egress firewall), but
+# github.com is whitelisted. This relay mode runs on a GitHub Actions runner:
+# it scrapes 591, writes per-listing raw JSON + WebP images under an output
+# dir, and the workflow commits them back to the repo. The GPU server then
+# `git pull`s and runs main.py --incoming fully offline.
+#
+#   Layout:
+#     <output_dir>/listings/<id>.json   raw_search + raw_metadata + manifest
+#     <output_dir>/images/<id>/<ord>.webp
+#
+# Files are written atomically and skipped when the payload hash is unchanged,
+# so repeated runs produce no git churn.
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
+                        limit: int = -1, placeholder: bool = False) -> int:
+    """Scrape (or replay fixtures) and persist raw JSON + WebP for git relay."""
+    out = Path(output_dir)
+    (out / "listings").mkdir(parents=True, exist_ok=True)
+    entries = fetch_raw_listings(fixtures=fixtures, limit=limit)
+    written = skipped = 0
+    for entry in entries:
+        item = entry.get("raw_search") or {}
+        pid = str(item.get("id") or "")
+        if not pid or pid == "None":
+            continue
+        urls = fetch_image_urls(item, entry.get("raw_metadata"))
+        webp_blobs: dict[int, bytes] = {}
+        for ordinal, url in enumerate(urls):
+            dest = out / "images" / pid / f"{ordinal:02d}.webp"
+            try:
+                if dest.exists() and _valid_webp(dest):
+                    webp_blobs[ordinal] = dest.read_bytes()
+                    continue
+                with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tf:
+                    tmp_path = Path(tf.name)
+                try:
+                    _grab_webp(url, tmp_path, placeholder=placeholder, key=f"{pid}:{ordinal}")
+                    webp_blobs[ordinal] = tmp_path.read_bytes()
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning("relay image %s/%s failed: %s", pid, ordinal, e)
+        manifest = {
+            "listing_id": pid,
+            "detail_failed": bool(entry.get("detail_failed")),
+            "image_urls": urls,
+            "images": sorted(webp_blobs),
+            "raw_search": item,
+            "raw_metadata": entry.get("raw_metadata"),
+        }
+        blob = json.dumps(
+            {k: manifest[k] for k in ("detail_failed", "image_urls", "images", "raw_search", "raw_metadata")},
+            sort_keys=True, ensure_ascii=False, default=str,
+        ).encode("utf-8")
+        digest = hashlib.sha256(blob).hexdigest()
+        lp = out / "listings" / f"{pid}.json"
+        if lp.exists():
+            try:
+                if json.loads(lp.read_text(encoding="utf-8")).get("payload_sha256") == digest:
+                    skipped += 1
+                    continue
+            except Exception:
+                pass
+        manifest["payload_sha256"] = digest
+        manifest["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _atomic_write_bytes(lp, json.dumps(manifest, ensure_ascii=False, default=str).encode("utf-8"))
+        for ordinal, data in webp_blobs.items():
+            _atomic_write_bytes(out / "images" / pid / f"{ordinal:02d}.webp", data)
+        written += 1
+    logger.info("relay dump -> %s: %s written, %s unchanged", out, written, skipped)
+    return written
+
+
+def _relay_main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="591 relay scraper (GitHub Actions side)")
+    parser.add_argument("--output-dir", default="data/incoming", help="where to write JSON + WebP")
+    parser.add_argument("--fixtures", action="store_true", help="replay captured fixtures (offline test)")
+    parser.add_argument("--limit", type=int, default=-1)
+    parser.add_argument("--placeholder", action="store_true",
+                        help="synthesize placeholder WebPs instead of fetching the CDN (offline test)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    dump_relay_payloads(args.output_dir, fixtures=args.fixtures, limit=args.limit,
+                        placeholder=args.placeholder)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_relay_main())
