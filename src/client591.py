@@ -13,6 +13,10 @@ _MOBILE_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/147.0.0.0 Mobile Safari/537.36"
 )
+_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
 
 REQUEST_TIMEOUT = int(os.environ.get("X591_TIMEOUT", "30"))
 # 591's cert is missing Subject Key Identifier; TLS verification is disabled only
@@ -36,6 +40,8 @@ class Client591:
                 "deviceid": self._device_id,
                 "origin": "https://m.591.com.tw",
                 "referer": "https://m.591.com.tw/",
+                "accept": "application/json, text/plain, */*",
+                "accept-language": "zh-TW,zh;q=0.9,en;q=0.8",
             }
         )
         self._session.cookies.set("T591_TOKEN", self._device_id)
@@ -53,6 +59,47 @@ class Client591:
         self._session.verify = VERIFY_SSL
         if not VERIFY_SSL:
             warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+        self._warmed = False
+
+    def _warmup(self) -> None:
+        """Prime WAF cookies (T591SSO/i18next) by visiting the site origin.
+
+        GitHub-hosted runner IPs are heavily flagged by 591's CloudFront WAF, which
+        returns 403 on a cold API call. A warm-up GET against the site establishes
+        the session cookies that let the subsequent API call through.
+        """
+        if self._warmed:
+            return
+        try:
+            self._session.get("https://m.591.com.tw/", timeout=REQUEST_TIMEOUT)
+        except requests.RequestException:
+            pass  # warm-up is best-effort; the API call still carries base headers
+        self._warmed = True
+
+    def _get_api(self, url: str, params: dict) -> dict:
+        """GET an API endpoint with warm-up + jittered retry on WAF 403."""
+        import random as _random
+
+        self._warmup()
+        last: Exception | None = None
+        for attempt in range(4):
+            try:
+                resp = self._session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                if resp.status_code == 403:
+                    # Cold/flagged edge: re-warm with a fresh cookie jar and back off.
+                    self._session.cookies.clear()
+                    self._warmed = False
+                    self._warmup()
+                    raise requests.HTTPError("403 WAF", response=resp)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                if code not in (403, 429) or attempt == 3:
+                    raise
+                last = e
+                time.sleep(_random.uniform(1.5, 4.0) * (attempt + 1))
+        raise last  # pragma: no cover
 
     def search_sale(
         self,
@@ -114,9 +161,7 @@ class Client591:
         if keywords is not None:
             params["keywords"] = keywords
 
-        resp = self._session.get(self._SALE_URL, params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get_api(self._SALE_URL, params)
 
     def search_rent(
         self,
@@ -159,9 +204,7 @@ class Client591:
         if keywords is not None:
             params["keywords"] = keywords
 
-        resp = self._session.get(self._RENT_URL, params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get_api(self._RENT_URL, params)
 
     def get_rent_detail(self, post_id: str | int) -> dict:
         """Fetch full detail for a rental listing.
@@ -169,9 +212,7 @@ class Client591:
         Args:
             post_id: Listing ID from search_rent results. e.g. 21044696
         """
-        resp = self._session.get(self._RENT_DETAIL_URL, params={"id": str(post_id)}, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        return self._get_api(self._RENT_DETAIL_URL, {"id": str(post_id)})
 
     def get_sale_detail(self, post_id: str | int) -> dict:
         """Fetch full detail for a sale listing.
@@ -182,13 +223,11 @@ class Client591:
         id_str = str(post_id)
         if not id_str.startswith("S"):
             id_str = f"S{id_str}"
-        resp = self._session.get(self._DETAIL_URL, params={
+        return self._get_api(self._DETAIL_URL, {
             "id": id_str,
             "device": "touch",
             "device_id": self._device_id,
-        }, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json()
+        })
 
 
 if __name__ == "__main__":

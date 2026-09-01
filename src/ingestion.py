@@ -551,8 +551,25 @@ def _relay_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--placeholder", action="store_true",
                         help="synthesize placeholder WebPs instead of fetching the CDN (offline test)")
+    parser.add_argument("--selftest", action="store_true",
+                        help="warm-up + single search_rent page, print result, write nothing")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.selftest:
+        client = Client591()
+        region_id, section_ids = _resolve_region_sections(
+            os.environ.get("X591_REGION", "台北市"), os.environ.get("X591_SECTION", ""))
+        kind = _resolve_kind(os.environ.get("X591_KIND", "整層住家"))
+        try:
+            result = client.search_rent(region_id=region_id, section_ids=section_ids, kind=kind,
+                                        price_str=os.environ.get("X591_PRICE_STR", "15000_25000"))
+            data = result.get("data", {})
+            print(f"selftest OK: {len(data.get('items', []))} items, "
+                  f"totalRows={data.get('totalRows')}, cookies={sorted(client._session.cookies.keys())}")
+            return 0
+        except Exception as e:
+            print(f"selftest FAILED: {type(e).__name__}: {e}")
+            return 1
     dump_relay_payloads(args.output_dir, fixtures=args.fixtures, limit=args.limit,
                         placeholder=args.placeholder)
     return 0

@@ -57,6 +57,9 @@ jobs:
           done
           exit $rc
 
+      - name: Self-test 591 API (warm-up + one search page)
+        run: python -m src.ingestion --selftest
+
       - name: Run scraper (dump raw payloads + WebP)
         run: |
           mkdir -p data/incoming
