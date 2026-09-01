@@ -129,3 +129,34 @@ real captured 591 responses in fixtures mode).
   `Title` header broke latin-1 header encoding and was fixed to `(x.x/5)`.
 - CUDA torch must be the `+cu128` build (`2.8.0+cu128`) to match the driver; default
   `2.13.0+cu130` fails to initialize. See `docs/BUILD_PLAN.md` for full notes.
+
+## GitHub Actions relay — live findings (verified 2026-09-01)
+
+The relay was deployed (`.github/workflows/scrape_relay.yml`) and run for real
+via `workflow_dispatch`. Observed behavior from GitHub-hosted runners:
+
+| Run | Runner egress IP | Site probe | rent/list API | img1/img2.591.com.tw |
+|---|---|---|---|---|
+| 1 | (pool A) | 301 / 404 | **403 WAF** | — |
+| 2 | 4.246.135.197 | 301 / 404 | **200 (24 listings committed to `data/incoming/`)** | 403 (hotlink) |
+| 3 | 172.182.253.37 | 403 / 403 | 403 | — |
+| 4 | 172.208.127.35 | 403 → 301 (+30s) | **200 (24 listings)** | **403 for every GET, even with `Referer: rent.591.com.tw`** |
+
+Conclusions:
+
+- 591's WAF **intermittently blocklists GitHub's shared runner IP pool at the IP
+  level** (same curl/UA succeeds from one runner IP and gets 403 from another;
+  the block also covers `m.591.com.tw` warm-up). It is not a header/cookie problem —
+  warm-up + browser headers are in place (`client591._warmup` / `_get_api`).
+- The image CDN 403s datacenter IPs outright; standard browser headers do not help.
+  We deliberately stop at correct browser headers (no proxy rotation / cookie spoofing).
+- Practical consequences:
+  - JSON relay works whenever a run draws an unblocked IP (cron `*/30` gives 48
+    attempts/day; successful runs commit real listings — proven twice).
+  - Set repo variable `RELAY_SKIP_IMAGES=true` for text-only runs while the CDN is
+    blocking; the GPU pipeline degrades to text-based Qwen analysis (all vision
+    flags false) for listings without images.
+  - **Definitive fix: run the same workflow on a self-hosted runner** on any
+    591-reachable network (change `runs-on:` to `[self-hosted, 591-relay]`). The
+    rest of the pipeline (git relay → `main.py --incoming` offline inference) is
+    unchanged.

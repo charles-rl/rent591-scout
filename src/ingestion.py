@@ -494,6 +494,7 @@ def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
     """Scrape (or replay fixtures) and persist raw JSON + WebP for git relay."""
     out = Path(output_dir)
     (out / "listings").mkdir(parents=True, exist_ok=True)
+    skip_images = os.environ.get("RELAY_SKIP_IMAGES", "").lower() in ("1", "true", "yes")
     entries = fetch_raw_listings(fixtures=fixtures, limit=limit)
     written = skipped = 0
     for entry in entries:
@@ -503,21 +504,22 @@ def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
             continue
         urls = fetch_image_urls(item, entry.get("raw_metadata"))
         webp_blobs: dict[int, bytes] = {}
-        for ordinal, url in enumerate(urls):
-            dest = out / "images" / pid / f"{ordinal:02d}.webp"
-            try:
-                if dest.exists() and _valid_webp(dest):
-                    webp_blobs[ordinal] = dest.read_bytes()
-                    continue
-                with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tf:
-                    tmp_path = Path(tf.name)
+        if not skip_images:
+            for ordinal, url in enumerate(urls):
+                dest = out / "images" / pid / f"{ordinal:02d}.webp"
                 try:
-                    _grab_webp(url, tmp_path, placeholder=placeholder, key=f"{pid}:{ordinal}")
-                    webp_blobs[ordinal] = tmp_path.read_bytes()
-                finally:
-                    tmp_path.unlink(missing_ok=True)
-            except Exception as e:
-                logger.warning("relay image %s/%s failed: %s", pid, ordinal, e)
+                    if dest.exists() and _valid_webp(dest):
+                        webp_blobs[ordinal] = dest.read_bytes()
+                        continue
+                    with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tf:
+                        tmp_path = Path(tf.name)
+                    try:
+                        _grab_webp(url, tmp_path, placeholder=placeholder, key=f"{pid}:{ordinal}")
+                        webp_blobs[ordinal] = tmp_path.read_bytes()
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning("relay image %s/%s failed: %s", pid, ordinal, e)
         manifest = {
             "listing_id": pid,
             "detail_failed": bool(entry.get("detail_failed")),

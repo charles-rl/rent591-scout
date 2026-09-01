@@ -28,6 +28,11 @@ concurrency:
 
 jobs:
   scrape:
+    # GitHub-hosted runners are intermittently 403'd by 591's WAF/CDN (datacenter
+    # IP blocklisting, incl. img1/img2.591.com.tw). If image pulls keep failing,
+    # switch to a self-hosted runner on a 591-reachable network:
+    #   runs-on: [self-hosted, 591-relay]
+    # Nothing else changes — the workflow never depends on GitHub-specific infra.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -65,6 +70,10 @@ jobs:
         run: python -m src.ingestion --selftest
 
       - name: Run scraper (dump raw payloads + WebP)
+        env:
+          # Set repo variable RELAY_SKIP_IMAGES=true for text-only relay while the
+          # image CDN is blocking runner IPs (saves ~350 doomed CDN hits per run).
+          RELAY_SKIP_IMAGES: ${{ vars.RELAY_SKIP_IMAGES }}
         run: |
           mkdir -p data/incoming
           python -m src.ingestion --output-dir data/incoming/ \

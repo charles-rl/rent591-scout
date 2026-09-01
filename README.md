@@ -41,6 +41,10 @@ payloads (no commit churn), the server skips already-processed hashes. `--incomi
 makes **zero** outbound calls to 591/CDN/ntfy (verified with `HTTPS_PROXY` pointed at a
 blackhole); notifications are off by default in this mode.
 
+> Live status: 591's WAF intermittently 403s GitHub's shared runner IPs and its image
+> CDN blocks datacenter IPs outright — JSON relay works on unblocked IPs (proven),
+> images need a self-hosted runner. Details: `docs/rent591-network-access.md`.
+
 ## Setup
 
 ```bash
