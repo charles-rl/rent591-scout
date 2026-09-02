@@ -8,7 +8,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from src import deduplication
 
@@ -23,9 +23,17 @@ if not (Path(_source).is_dir() and (Path(_source) / "model.safetensors").is_file
 
 
 def _synth(tmp_dir: Path, seed: int) -> str:
+    """Structured deterministic image: DINOv3 CLS collapses on textureless pure noise
+    (cos ~0.99 between unrelated noise images), so fixtures need real shapes/regions."""
     rng = np.random.default_rng(seed)
+    img = Image.new("RGB", (256, 256), (235, 230, 220))
+    dr = ImageDraw.Draw(img)
+    for _ in range(6):
+        x0, y0 = (int(v) for v in rng.integers(0, 190, 2))
+        x1, y1 = x0 + int(rng.integers(30, 70)), y0 + int(rng.integers(30, 70))
+        dr.rectangle([x0, y0, x1, y1], fill=tuple(int(c) for c in rng.integers(0, 255, 3)))
     p = tmp_dir / f"synth_{seed}.webp"
-    Image.fromarray(rng.integers(0, 255, (256, 256, 3), dtype=np.uint8)).save(p, "WEBP")
+    img.save(p, "WEBP")
     return str(p)
 
 
@@ -47,7 +55,7 @@ def webp_set(tmp_path_factory):
         return {"ref": str(ref), "dup": str(dup), "unrelated": str(unr), "source": "real"}
     return {
         "ref": _synth(d, 1),
-        "dup": _synth(d, 2),  # same seed -> identical image
+        "dup": _synth(d, 1),  # same seed -> byte-identical image
         "unrelated": _synth(d, 99),
         "source": "synthetic",
     }

@@ -76,7 +76,7 @@ def test_pending_drains_to_completed_with_suffix(queue_db):
     assert row["image_status"] == "completed"
     # bare CDN originals must be requested as the !fit resize variant (403 otherwise)
     assert all(u.endswith(image_queue.PROXY_IMAGE_SUFFIX) for u in session.requested)
-    lid, rows = results[0]
+    _lid, rows = results[0]
     assert len(rows) == 2 and all(r["image_path"] for r in rows)
     for r in rows:
         img = Image.open(r["image_path"])

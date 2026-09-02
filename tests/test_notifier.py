@@ -26,7 +26,7 @@ def posts(monkeypatch):
 
 
 def test_alert_prefers_tunnel(posts):
-    fake_post, calls = posts
+    _fake_post, calls = posts
     assert notifier.send_ntfy_alert(
         {"listing_id": "1", "title": "t", "url": "u"}, 4.0, 3.5, proxy="http://127.0.0.1:8999"
     ) is True

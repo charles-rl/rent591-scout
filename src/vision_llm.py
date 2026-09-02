@@ -86,21 +86,29 @@ def construct_full_prompt(bullets: str | None) -> str:
     return f"{BASE_SYSTEM_PROMPT}\n\n### User Context & Evolving Preferences ###\n{dynamic}"
 
 
-def _image_b64(path: str) -> str:
-    """Downscale before encode: full-size PNG base64 bloats every Ollama call."""
+def _image_b64(path: str) -> str | None:
+    """Downscale before encode: full-size PNG base64 bloats every Ollama call.
+
+    Returns None for missing/corrupt files so one dead photo never fails the
+    whole vision pass (DB rows can outlive data/images/ cleanups).
+    """
     from PIL import Image
-    with Image.open(path) as raw:
-        img = raw.convert("RGB")
     try:
-        w, h = img.size
-        m = max(w, h)
-        if m > VLM_IMAGE_MAX_SIDE:
-            scale = VLM_IMAGE_MAX_SIDE / m
-            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=85)
-    finally:
-        img.close()
+        with Image.open(path) as raw:
+            img = raw.convert("RGB")
+        try:
+            w, h = img.size
+            m = max(w, h)
+            if m > VLM_IMAGE_MAX_SIDE:
+                scale = VLM_IMAGE_MAX_SIDE / m
+                img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=85)
+        finally:
+            img.close()
+    except Exception as e:
+        logger.warning("image %s skipped for vision: %s", path, e)
+        return None
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -125,7 +133,7 @@ def build_messages(listing: dict, image_paths: list[str], bullets: str | None) -
         "Images are attached below (each corresponds to one photo of the property)."
     )
     user_msg: dict = {"role": "user", "content": text}
-    images = [_image_b64(p) for p in image_paths[:VLM_MAX_IMAGES] if p]
+    images = [b for b in (_image_b64(p) for p in image_paths[:VLM_MAX_IMAGES] if p) if b]
     if images:
         user_msg["images"] = images
     return [

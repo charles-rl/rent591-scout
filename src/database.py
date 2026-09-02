@@ -209,11 +209,14 @@ def replace_images(conn: sqlite3.Connection, listing_id: str, images: list[dict]
 
 
 def get_all_images(conn: sqlite3.Connection) -> dict[str, list[dict]]:
-    rows = conn.execute("SELECT listing_id, ordinal, image_path, dino_embedding FROM listing_images").fetchall()
+    rows = conn.execute(
+        "SELECT listing_id, ordinal, image_url, image_path, dino_embedding FROM listing_images ORDER BY ordinal"
+    ).fetchall()
     out: dict[str, list[dict]] = {}
     for r in rows:
         out.setdefault(r["listing_id"], []).append(
-            {"ordinal": r["ordinal"], "image_path": r["image_path"], "dino_embedding": r["dino_embedding"]}
+            {"ordinal": r["ordinal"], "image_url": r["image_url"],
+             "image_path": r["image_path"], "dino_embedding": r["dino_embedding"]}
         )
     return out
 

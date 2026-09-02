@@ -1,6 +1,5 @@
 """Proxy health detector: only a real HTTP 200 through the tunnel means LIVE."""
 
-import pytest
 import requests
 
 from src.utils import proxy_check

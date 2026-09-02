@@ -70,7 +70,9 @@ Details & gotchas:
 - ntfy delivery is **tunnel-first with direct fallback** for every alert (match +
   proxy-request). When the PC is fully powered off there is no network path at
   that moment — the alert is best-effort by design; the queue and DB state persist.
-- Listings stuck `completed` but unscored (Ollama was down) are retried every run.
+- Listings stuck `completed` but unscored (Ollama was down) are retried every run; the
+  retry reloads their stored `listing_images` rows so embeddings are never lost, and one
+  missing/corrupt photo file is skipped instead of failing the whole vision call.
 - `listings.image_status` lifecycle: `pending → completed | failed | skipped`
   (skipped = inactive or no photos). The migration requeues legacy rows whose photo
   files are missing or solid-color placeholders from old `PLACEHOLDER_IMAGES=1` runs.

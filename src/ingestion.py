@@ -16,7 +16,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
@@ -244,7 +244,7 @@ def _int_price(raw: str | int | None) -> int:
     return int(m.group(0).replace(",", "")) if m else 0
 
 
-def _float_price(raw: str | int | float | None) -> float | None:
+def _float_price(raw: str | float | None) -> float | None:
     if isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
@@ -443,7 +443,7 @@ def download_images(listing_id: str, urls: list[str], placeholder: bool = False)
 def scraper_fallback(listing_id: str) -> dict | None:
     """DrissionPage detail scrape. Returns DOM dict or None on any failure."""
     try:
-        from DrissionPage import ChromiumPage, ChromiumOptions  # non-commercial license
+        from DrissionPage import ChromiumOptions, ChromiumPage  # non-commercial license
     except Exception:
         return None
     try:
@@ -497,7 +497,7 @@ def scraper_fallback(listing_id: str) -> dict | None:
         finally:
             try:
                 page.quit()
-            except Exception:
+            except Exception:  # noqa: S110 - browser teardown must never mask the result
                 pass
     except Exception as e:
         logger.warning("scraper fallback %s failed: %s", listing_id, e)
@@ -621,10 +621,10 @@ def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
                 if json.loads(lp.read_text(encoding="utf-8")).get("payload_sha256") == digest:
                     skipped += 1
                     continue
-            except Exception:
+            except Exception:  # noqa: S110 - unreadable/stale payload file just gets rewritten
                 pass
         manifest["payload_sha256"] = digest
-        manifest["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        manifest["scraped_at"] = datetime.now(UTC).isoformat(timespec="seconds")
         _atomic_write_bytes(lp, json.dumps(manifest, ensure_ascii=False, default=str).encode("utf-8"))
         for ordinal, data in webp_blobs.items():
             _atomic_write_bytes(out / "images" / pid / f"{ordinal:02d}.webp", data)

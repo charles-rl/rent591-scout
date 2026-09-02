@@ -2,6 +2,7 @@
 
 import io
 import json
+from typing import ClassVar
 
 import pytest
 from PIL import Image
@@ -182,7 +183,7 @@ def test_online_drains_pending_then_scores(env, tmp_path):
     class Resp:
         content: bytes
         status_code = 200
-        headers = {"content-type": "image/jpeg"}
+        headers: ClassVar[dict] = {"content-type": "image/jpeg"}
 
         def raise_for_status(self):
             pass
@@ -228,3 +229,11 @@ def test_completed_but_unscored_is_retried_next_run(env):
                                lambda listing, image_rows, bullets: dict(VISION_OK))
     assert main.run_incoming(env["incoming"], -1, do_notify=None) == 0
     assert _row(env, lid)["predicted_score"] == pytest.approx(4.5)
+    # Regression: self-heal must reload stored image rows, not wipe them with [].
+    conn = database.connect(env["db_path"])
+    try:
+        imgs = conn.execute(
+            "SELECT image_path FROM listing_images WHERE listing_id=?", (lid,)).fetchall()
+    finally:
+        conn.close()
+    assert len(imgs) == 1 and imgs[0]["image_path"]

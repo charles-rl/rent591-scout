@@ -353,8 +353,13 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                 database.mark_text_only_notified(conn)
 
         # Self-heal: images completed earlier whose vision pass never ran.
+        # Reload stored image rows (with real paths) — passing [] would make
+        # finalize_listing run text-only and wipe the stored embeddings.
+        stored_images = database.get_all_images(conn)
         for row in database.get_completed_unscored(conn):
-            vision_targets.setdefault(str(row["listing_id"]), [])
+            lid = str(row["listing_id"])
+            vision_targets.setdefault(
+                lid, [r for r in stored_images.get(lid, []) if r.get("image_path")])
 
         if vision_targets:
             baseline = load_baseline(conn)
