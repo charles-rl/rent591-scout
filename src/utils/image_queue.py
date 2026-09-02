@@ -67,6 +67,26 @@ def _fetch_url(url: str) -> str:
     return url
 
 
+PLACEHOLDER_MAX_BYTES = int(os.environ.get("PLACEHOLDER_MAX_BYTES", "4096"))
+
+
+def looks_placeholder(path: Path) -> bool:
+    """True for synthesized solid-color WebPs left by PLACEHOLDER_IMAGES runs.
+
+    Fixture placeholders are 800x600 flat colors (~1KB, <=16 distinct colors);
+    real photos are far larger and full-color. Used so the download cache never
+    skips a fake in place of a real CDN fetch.
+    """
+    try:
+        if path.stat().st_size > PLACEHOLDER_MAX_BYTES:
+            return False
+        with Image.open(path) as img:
+            colors = img.convert("RGB").getcolors(maxcolors=16)
+        return colors is not None and len(colors) <= 16
+    except Exception:
+        return True
+
+
 def _download_one(session: requests.Session, url: str, dest: Path) -> bool:
     """Fetch url through the proxy and save as WebP q=85. Returns True on success.
 
@@ -74,7 +94,7 @@ def _download_one(session: requests.Session, url: str, dest: Path) -> bool:
     tunnel itself died mid-run — caller distinguishes that from persistent
     per-image HTTP errors (403/404).
     """
-    if dest.exists() and _valid_webp(dest):
+    if dest.exists() and _valid_webp(dest) and not looks_placeholder(dest):
         return True
     try:
         resp = session.get(_fetch_url(url), timeout=DOWNLOAD_TIMEOUT)

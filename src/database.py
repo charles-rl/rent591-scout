@@ -110,6 +110,39 @@ def _backfill_image_status(conn: sqlite3.Connection) -> None:
         "WHEN image_paths IS NOT NULL THEN 'completed' ELSE 'skipped' END "
         "WHERE predicted_score IS NOT NULL OR IFNULL(is_active, 1) = 0"
     )
+    _requeue_missing_image_files(conn)
+
+
+def _requeue_missing_image_files(conn: sqlite3.Connection) -> None:
+    """'completed' is a lie when the photo files never made it to disk (or are
+    1KB solid-color placeholders from PLACEHOLDER_IMAGES fixture runs). Requeue
+    those listings so the hybrid proxy drain re-downloads real photos.
+    """
+    root = Path(__file__).resolve().parent.parent
+    rows = conn.execute(
+        "SELECT listing_id, image_paths FROM listings "
+        "WHERE image_status = 'completed' AND image_urls IS NOT NULL AND image_urls NOT IN ('', '[]')"
+    ).fetchall()
+    for listing_id, paths_json in rows:
+        try:
+            paths = json.loads(paths_json) if paths_json else []
+        except (TypeError, ValueError):
+            paths = []
+        real = False
+        for p in paths:
+            if not p:
+                continue
+            f = Path(p) if Path(p).is_absolute() else root / p
+            try:
+                if f.is_file() and f.stat().st_size > 4096:
+                    real = True
+                    break
+            except OSError:
+                continue
+        if not real:
+            conn.execute(
+                "UPDATE listings SET image_status = 'pending' WHERE listing_id = ?", (listing_id,)
+            )
 
 
 def _json(value):
