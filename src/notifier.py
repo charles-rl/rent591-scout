@@ -18,8 +18,27 @@ def _header_safe(value: str) -> str:
     return str(value or "").encode("latin-1", "ignore").decode("latin-1").strip()
 
 
-def send_ntfy_alert(listing: dict, predicted_score: float | None = None, threshold: float = 3.5) -> bool:
-    """Push an ntfy.sh alert for a high-scoring match. Non-fatal: returns False on failure."""
+def _post(message: str, headers: dict, proxy: str | None = None) -> bool:
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        resp = requests.post(
+            f"{NTFY_URL}/{NTFY_TOPIC}", data=message.encode("utf-8"),
+            headers=headers, timeout=15, proxies=proxies,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning("ntfy push failed: %s", e)
+        return False
+
+
+def send_ntfy_alert(listing: dict, predicted_score: float | None = None, threshold: float = 3.5,
+                    proxy: str | None = None) -> bool:
+    """Push an ntfy.sh alert for a high-scoring match. Non-fatal: returns False on failure.
+
+    proxy: forward through the PC devtunnel (ntfy.sh is blocked from the GPU
+    server directly; the tunnel path works while the PC is online).
+    """
     if predicted_score is None:
         predicted_score = float(listing.get("predicted_score") or 0.0)
     if predicted_score < threshold:
@@ -38,10 +57,21 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
         "Click": _header_safe(url),
         "Tags": "house,bathroom",
     }
-    try:
-        resp = requests.post(f"{NTFY_URL}/{NTFY_TOPIC}", data=message.encode("utf-8"), headers=headers, timeout=15)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("ntfy push failed: %s", e)
+    return _post(message, headers, proxy=proxy)
+
+
+def send_proxy_request_alert(pending_count: int, proxy: str | None = None) -> bool:
+    """Ask the user to power on the PC and start the devtunnel so queued
+    listing images can be fetched. Non-fatal: returns False on failure."""
+    if pending_count <= 0:
         return False
+    message = (
+        f"🏠 [591 Monitor] {pending_count} new listings queued for vision processing. "
+        "Connect PC proxy (port 8999) to process images."
+    )
+    headers = {
+        "Title": _header_safe("PC proxy needed"),
+        "Tags": "house,warning",
+        "Priority": "high",
+    }
+    return _post(message, headers, proxy=proxy)

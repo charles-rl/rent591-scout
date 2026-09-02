@@ -5,7 +5,8 @@ Loop: ingest -> dead-link filter -> DINOv3 dedup -> Qwen vision -> score -> noti
 
 Usage:
   python main.py                        # live run (requires 591 network access)
-  python main.py --incoming             # offline run over data/incoming/ (git relay payloads)
+  python main.py --incoming             # hybrid run over data/incoming/ (relay text always;
+                                        # images + vision via PC devtunnel proxy when live)
   python main.py --fixtures --limit 3   # offline test using captured fixtures
   python main.py --train                # train XGBoost head from rated rows
 """
@@ -33,7 +34,7 @@ from src import (
     scoring,
     vision_llm,
 )
-from src.utils import health_check
+from src.utils import health_check, image_queue, proxy_check
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -42,6 +43,48 @@ SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", "3.5"))
 DEDUP_THRESHOLD = float(os.environ.get("DEDUP_THRESHOLD", "0.95"))
 PLACEHOLDER = os.environ.get("PLACEHOLDER_IMAGES", "").lower() in ("1", "true", "yes")
 INCOMING_DIR = Path(os.environ.get("INCOMING_DIR", ROOT / "data" / "incoming"))
+PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:8999")
+
+_ROW_JSON_FIELDS = ("tags", "contain_cost", "facilities", "image_urls", "image_paths",
+                    "qwen_warnings", "qwen_vision_flags")
+
+
+def _listing_from_row(row) -> dict:
+    """DB row -> listing dict with JSON columns parsed back into Python objects."""
+    listing = dict(row)
+    for field in _ROW_JSON_FIELDS:
+        raw = listing.get(field)
+        if isinstance(raw, str):
+            try:
+                listing[field] = json.loads(raw)
+            except ValueError:
+                listing[field] = None
+    return listing
+
+
+def extract_text_warnings(listing: dict) -> list[str]:
+    """Cheap rule pass over text metadata (floor / utilities / pricing rules).
+
+    Runs at ingestion so listings queued without images already carry warnings;
+    the Qwen pass later merges these with its own (deduped in finalize_listing).
+    """
+    warnings: list[str] = []
+    floor = str(listing.get("floor") or "")
+    if any(m in floor for m in ("頂樓", "顶楼", "頂層")):
+        warnings.append("頂樓：可能炎熱/漏水")
+    elif any(m in floor for m in ("一樓", "1樓")):
+        warnings.append("一樓：注意採光與隱私")
+    blob = str(listing.get("description") or "")
+    if any(m in blob for m in ("水電另計", "電費另計", "水費另計", "代管理費", "管理費另")):
+        warnings.append("水電/管理費另計")
+    deposit = str(listing.get("deposit") or "")
+    if "半年" in deposit:
+        warnings.append("要求半年付")
+    elif "季" in deposit:
+        warnings.append("要求季付")
+    elif "年" in deposit and "一年" not in deposit:
+        warnings.append(f"付款規則：{deposit}")
+    return warnings
 
 
 def load_baseline(conn) -> dict[str, list]:
@@ -56,12 +99,11 @@ def load_baseline(conn) -> dict[str, list]:
     return baseline
 
 
-def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
-                    incoming_dir: Path | None = None) -> str:
-    """One listing through the pipeline. Returns outcome: stored|inactive|duplicate|failed.
+def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool) -> str:
+    """One live-mode listing through the pipeline. Returns outcome: stored|inactive|duplicate|failed.
 
-    incoming_dir: when set, the payload came from the GitHub relay — images are
-    already on local disk and no 591 HTTP call (scraper fallback / CDN) is made.
+    Direct 591 access (needs network to rent.591.com.tw); the GitHub-relay
+    offline/hybrid path lives in run_incoming().
     """
     item, data = entry["raw_search"], entry["raw_metadata"]
     detail_failed = entry.get("detail_failed", False)
@@ -70,36 +112,35 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
     if not listing["is_active"]:
         logger.info("%s delisted/inactive -> skip", listing["listing_id"])
         listing["is_active"] = False
+        listing["image_status"] = "skipped"
         database.upsert_listing(conn, listing)
         return "inactive"
 
-    # Health check: live DOM probe (591 reachable) or offline payload inspection.
-    probe = listing["url"] if incoming_dir is None else {"status": listing.get("status")}
-    if not health_check.is_listing_active(probe):
+    # Health check: live DOM probe (591 reachable).
+    if not health_check.is_listing_active(listing["url"]):
         logger.info("%s health check: dead/expired listing -> is_active=0", listing["listing_id"])
         health_check.mark_listing_inactive(conn, listing["listing_id"])
         return "inactive"
 
-    if incoming_dir is None:
-        # 591scraper DOM fallback enrichment (best-effort; needs browser + 591 access).
-        scraper = ingestion.scraper_fallback(listing["listing_id"])
-        if scraper:
-            listing = ingestion.apply_scraper(listing, scraper)
-        urls = ingestion.fetch_image_urls(item, data)
-        image_rows = ingestion.download_images(listing["listing_id"], urls, placeholder=PLACEHOLDER)
-    else:
-        urls = entry.get("image_urls") or []
-        image_rows = []
-        for ordinal, url in enumerate(urls):
-            p = incoming_dir / "images" / listing["listing_id"] / f"{ordinal:02d}.webp"
-            image_rows.append({
-                "ordinal": ordinal, "image_url": url,
-                "image_path": str(p) if p.is_file() else None,
-            })
+    # 591scraper DOM fallback enrichment (best-effort; needs browser + 591 access).
+    scraper = ingestion.scraper_fallback(listing["listing_id"])
+    if scraper:
+        listing = ingestion.apply_scraper(listing, scraper)
+    urls = ingestion.fetch_image_urls(item, data)
+    image_rows = ingestion.download_images(listing["listing_id"], urls, placeholder=PLACEHOLDER)
 
     listing["image_urls"] = urls
     listing["image_paths"] = [r["image_path"] for r in image_rows]
+    return finalize_listing(conn, listing, image_rows, baseline, bullets, do_notify)
 
+
+def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict,
+                     bullets, do_notify: bool, proxy: str | None = None) -> str:
+    """DINOv3 dedup -> Qwen 27B vision -> XGBoost score -> store -> notify.
+
+    Shared tail of the live path and the hybrid image-queue path.
+    Returns outcome: stored|duplicate|failed.
+    """
     # DINOv3 embeddings + dedup (exclude this listing's own stored vectors).
     new_vecs = deduplication.embed_image_rows(image_rows)
     for r in image_rows:
@@ -121,7 +162,9 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
     if analysis is None:
         logger.warning("%s vision analysis failed -> skip", listing["listing_id"])
         return "failed"
-    listing["qwen_warnings"] = analysis["qwen_warnings"]
+    # Merge ingestion-time rule warnings (floor/utilities/pricing) with VLM ones.
+    text_warnings = [str(w) for w in (listing.get("qwen_warnings") or [])]
+    listing["qwen_warnings"] = list(dict.fromkeys(text_warnings + list(analysis["qwen_warnings"])))
     listing["qwen_vision_flags"] = analysis["vision_flags"]
     listing["qwen_direct_score"] = analysis["qwen_direct_score"]
 
@@ -130,7 +173,7 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
     listing["dino_embedding"] = agg
     dino_vec = np.frombuffer(agg, dtype=np.float32) if agg else np.zeros(768, dtype=np.float32)
     predicted, source = scoring.predict_score(
-        conn, dino_vec, analysis["vision_flags"], analysis["qwen_warnings"],
+        conn, dino_vec, analysis["vision_flags"], listing["qwen_warnings"],
         analysis["qwen_direct_score"],
     )
     listing["predicted_score"] = predicted
@@ -149,7 +192,7 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
 
     # Notify.
     if do_notify:
-        notifier.send_ntfy_alert(listing, predicted, SCORE_THRESHOLD)
+        notifier.send_ntfy_alert(listing, predicted, SCORE_THRESHOLD, proxy=proxy)
     return "stored"
 
 
@@ -184,23 +227,31 @@ def run(fixtures: bool, limit: int, do_notify: bool) -> int:
     return 1 if failed else 0
 
 
-def run_incoming(incoming_dir: Path, limit: int, do_notify: bool) -> int:
-    """Offline pipeline over data/incoming/ payloads pushed by the GitHub relay.
+def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
+    """Hybrid pipeline over data/incoming/ payloads pushed by the GitHub relay.
 
-    Strictly local: no HTTP to 591 domains, no CDN downloads, no DOM scraper.
-    Only localhost inference (Ollama, DINOv3 cache) and the local SQLite DB.
+    Phase 1 (runs always): text-only ingestion — store metadata with
+    image_status='pending' plus rule-based text warnings; no network at all.
+    Phase 2: probe the PC devtunnel proxy (PROXY_URL).
+      LIVE    -> drain the pending image queue through it, then run
+                 DINOv3 dedup + Qwen vision + XGBoost scoring per listing and
+                 push match alerts (score >= 3.5) via the tunnel.
+      OFFLINE -> one ntfy "connect the PC proxy" alert per un-notified pending
+                 batch (text_only_notified prevents spam).
     """
     listings_dir = incoming_dir / "listings"
     if not listings_dir.is_dir():
         logger.error("incoming dir not found: %s (run the relay or `git pull` first)", listings_dir)
         return 1
     conn = None
-    counters = {"stored": 0, "inactive": 0, "duplicate": 0, "failed": 0, "skipped": 0}
+    counters = {"ingested": 0, "inactive": 0, "skipped": 0, "stored": 0,
+                "duplicate": 0, "failed": 0, "queued": 0}
+    vision_targets: dict[str, list[dict]] = {}
     try:
         conn = database.connect()
         bullets = dynamic_prompt.get_bullets(conn)
-        baseline = load_baseline(conn)
 
+        # ---- Phase 1: text ingestion (always) --------------------------------
         paths = sorted(listings_dir.glob("*.json"))
         logger.info("incoming: %s payload files", len(paths))
         for path in paths:
@@ -218,24 +269,85 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool) -> int:
             if database.relay_is_processed(conn, lid, sha):
                 counters["skipped"] += 1
                 continue
-            entry = {
-                "raw_search": payload.get("raw_search"),
-                "raw_metadata": payload.get("raw_metadata"),
-                "detail_failed": payload.get("detail_failed", False),
-                "image_urls": payload.get("image_urls") or [],
-            }
             try:
-                outcome = process_listing(conn, entry, baseline, bullets, do_notify,
-                                          incoming_dir=incoming_dir)
+                listing = ingestion.normalize_listing(
+                    payload.get("raw_search"), payload.get("raw_metadata"),
+                    detail_failed=payload.get("detail_failed", False),
+                )
+                if not listing["is_active"]:
+                    logger.info("%s delisted/inactive -> skip", lid)
+                    listing["image_status"] = "skipped"
+                    database.upsert_listing(conn, listing)
+                    counters["inactive"] += 1
+                elif not health_check.is_listing_active({"status": listing.get("status")}):
+                    logger.info("%s health check: dead/expired -> is_active=0", lid)
+                    health_check.mark_listing_inactive(conn, lid)
+                    counters["inactive"] += 1
+                else:
+                    listing["qwen_warnings"] = extract_text_warnings(listing)
+                    urls = payload.get("image_urls") or []
+                    listing["image_urls"] = urls
+                    rows = []
+                    for ordinal, url in enumerate(urls):
+                        p = incoming_dir / "images" / lid / f"{ordinal:02d}.webp"
+                        rows.append({"ordinal": ordinal, "image_url": url,
+                                     "image_path": str(p) if ingestion._valid_webp(p) else None})
+                    if not urls:
+                        listing["image_status"] = "skipped"
+                        vision_targets[lid] = []
+                    elif all(r["image_path"] for r in rows):
+                        listing["image_status"] = "completed"
+                        listing["image_paths"] = [r["image_path"] for r in rows]
+                        vision_targets[lid] = rows
+                    else:
+                        listing["image_status"] = "pending"
+                        counters["queued"] += 1
+                    database.upsert_listing(conn, listing)
+                    database.reset_text_only_notified(conn, lid)
+                    if listing["image_status"] == "completed":
+                        database.replace_images(conn, lid, rows)
+                database.mark_relay_processed(conn, lid, sha)
+                counters["ingested"] += 1
             except Exception:
                 logger.exception("incoming listing %s failed", lid)
                 counters["failed"] += 1
                 continue
-            counters[outcome] += 1
-            if outcome in ("stored", "inactive", "duplicate"):
-                database.mark_relay_processed(conn, lid, sha)
-            if 0 < limit <= sum(counters.values()):
+            if 0 < limit <= counters["ingested"] + counters["failed"]:
                 break
+
+        # ---- Phase 2: proxy check & branching ---------------------------------
+        proxy_live = proxy_check.is_proxy_available(PROXY_URL)
+        effective_notify = bool(proxy_live) if do_notify is None else do_notify
+        logger.info("proxy %s: %s", PROXY_URL, "LIVE" if proxy_live else "OFFLINE")
+        if proxy_live:
+            for lid, rows in image_queue.process_pending_images(conn, PROXY_URL):
+                vision_targets[lid] = rows
+        else:
+            pending_alerts = database.count_pending_unnotified(conn)
+            if pending_alerts:
+                logger.info("%d pending listings -> proxy request alert", pending_alerts)
+                notifier.send_proxy_request_alert(pending_alerts)
+                database.mark_text_only_notified(conn)
+
+        # Self-heal: images completed earlier whose vision pass never ran.
+        for row in database.get_completed_unscored(conn):
+            vision_targets.setdefault(str(row["listing_id"]), [])
+
+        if vision_targets:
+            baseline = load_baseline(conn)
+            for lid, rows in vision_targets.items():
+                row = conn.execute("SELECT * FROM listings WHERE listing_id=?", (lid,)).fetchone()
+                if row is None:
+                    continue
+                try:
+                    outcome = finalize_listing(
+                        conn, _listing_from_row(row), rows, baseline, bullets,
+                        effective_notify, proxy=PROXY_URL if proxy_live else None,
+                    )
+                    counters[outcome] += 1
+                except Exception:
+                    logger.exception("vision pass failed for %s", lid)
+                    counters["failed"] += 1
     except Exception:
         logger.exception("fatal incoming pipeline error")
         return 1
@@ -272,11 +384,12 @@ def main() -> None:
             conn.close()
         return
 
-    # ntfy.sh is blocked from the GPU server; --incoming defaults to no notifications.
-    do_notify = args.notify if args.notify is not None else not args.incoming
-
     if args.incoming:
-        sys.exit(run_incoming(args.incoming_dir, args.limit, do_notify))
+        # Hybrid: do_notify=None -> alerts auto-enable while the PC proxy is live
+        # (ntfy.sh is blocked from the GPU server directly; match alerts route
+        # through the devtunnel).
+        sys.exit(run_incoming(args.incoming_dir, args.limit, args.notify))
+    do_notify = args.notify if args.notify is not None else True
     run(fixtures=args.fixtures, limit=args.limit, do_notify=do_notify)
 
 

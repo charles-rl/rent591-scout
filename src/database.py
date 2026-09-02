@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS listings (
     qwen_warnings JSON, qwen_vision_flags JSON, qwen_direct_score REAL,
     dino_embedding BLOB,
     predicted_score REAL, score_source TEXT,
+    image_status TEXT DEFAULT 'pending',
+    text_only_notified BOOLEAN DEFAULT FALSE,
     user_rated BOOLEAN DEFAULT FALSE,
     user_score REAL, bathroom_score REAL, user_comments TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -82,6 +84,8 @@ _EXTRA_COLUMNS = [
     ("social_house", "BOOLEAN"),
     ("facilities", "JSON"),
     ("is_duplicate", "BOOLEAN DEFAULT FALSE"),
+    ("image_status", "TEXT DEFAULT 'pending'"),
+    ("text_only_notified", "BOOLEAN DEFAULT FALSE"),
 ]
 
 
@@ -91,6 +95,21 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     for name, decl in _EXTRA_COLUMNS:
         if name not in existing:
             conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
+            if name == "image_status":
+                _backfill_image_status(conn)
+
+
+def _backfill_image_status(conn: sqlite3.Connection) -> None:
+    """ALTER TABLE applies the DEFAULT to pre-existing rows, which would flood
+    the queue with already-processed listings. Rows that made it through the
+    pre-hybrid pipeline get their terminal status; only unfinished active
+    listings (vision never scored them) stay 'pending' for the proxy to drain.
+    """
+    conn.execute(
+        "UPDATE listings SET image_status = CASE "
+        "WHEN image_paths IS NOT NULL THEN 'completed' ELSE 'skipped' END "
+        "WHERE predicted_score IS NOT NULL OR IFNULL(is_active, 1) = 0"
+    )
 
 
 def _json(value):
@@ -109,19 +128,24 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "description", "image_urls", "image_paths",
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score",
         "dino_embedding", "predicted_score", "score_source",
+        "image_status",
     ]
     placeholders = ", ".join(
         # First insert: never bind a raw NULL — fall back to the stored flag
         # (inactive re-runs) then FALSE, so is_duplicate is never NULL.
         "COALESCE(:is_duplicate, (SELECT is_duplicate FROM listings WHERE listing_id = :listing_id), FALSE)"
-        if c == "is_duplicate" else f":{c}"
+        if c == "is_duplicate" else
+        "COALESCE(:image_status, (SELECT image_status FROM listings WHERE listing_id = :listing_id), 'pending')"
+        if c == "image_status" else f":{c}"
         for c in cols
     )
     # COALESCE keeps previously stored values when this run's payload is degraded
     # (e.g. detail fetch failed), preventing NULL-wipe of lat/tags/scores.
     sets = ", ".join(
         "is_duplicate=COALESCE(excluded.is_duplicate, listings.is_duplicate, FALSE)"
-        if c == "is_duplicate" else f"{c}=COALESCE(excluded.{c}, listings.{c})"
+        if c == "is_duplicate" else
+        "image_status=COALESCE(excluded.image_status, listings.image_status, 'pending')"
+        if c == "image_status" else f"{c}=COALESCE(excluded.{c}, listings.{c})"
         for c in cols
     )
     sql = f"INSERT INTO listings ({', '.join(cols)}) VALUES ({placeholders}) " \
@@ -204,6 +228,65 @@ def rate_listing(conn: sqlite3.Connection, listing_id: str, score: float,
     cur = conn.execute(
         "UPDATE listings SET user_rated=1, user_score=?, bathroom_score=?, user_comments=? WHERE listing_id=?",
         (score, bathroom, comment, listing_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Pending-image queue (hybrid proxy mode)
+# ---------------------------------------------------------------------------
+def get_pending_image_listings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Active listings still awaiting image download/vision processing (oldest first)."""
+    return conn.execute(
+        "SELECT * FROM listings WHERE IFNULL(is_active, 1) = 1 AND image_status = 'pending' "
+        "ORDER BY updated_at ASC"
+    ).fetchall()
+
+
+def set_image_status(conn: sqlite3.Connection, listing_id: str, status: str,
+                     image_paths: list | None = None) -> bool:
+    """Transition listings.image_status; optionally refresh image_paths JSON."""
+    cur = conn.execute(
+        "UPDATE listings SET image_status=?, image_paths=COALESCE(?, image_paths), "
+        "updated_at=CURRENT_TIMESTAMP WHERE listing_id=?",
+        (status, _json(image_paths) if image_paths is not None else None, str(listing_id)),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_completed_unscored(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Images ready but vision never finished (Ollama was down) — retried each run."""
+    return conn.execute(
+        "SELECT * FROM listings WHERE IFNULL(is_active, 1) = 1 "
+        "AND image_status IN ('completed', 'skipped') AND predicted_score IS NULL "
+        "AND IFNULL(is_duplicate, 0) = 0"
+    ).fetchall()
+
+
+def count_pending_unnotified(conn: sqlite3.Connection) -> int:
+    """Pending listings that never triggered a proxy-request alert."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM listings "
+        "WHERE IFNULL(is_active, 1) = 1 AND image_status = 'pending' AND IFNULL(text_only_notified, 0) = 0"
+    ).fetchone()[0]
+
+
+def mark_text_only_notified(conn: sqlite3.Connection) -> int:
+    """Flag all currently-pending listings as alerted (anti-spam for proxy requests)."""
+    cur = conn.execute(
+        "UPDATE listings SET text_only_notified = TRUE "
+        "WHERE image_status = 'pending' AND IFNULL(text_only_notified, 0) = 0"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def reset_text_only_notified(conn: sqlite3.Connection, listing_id: str) -> bool:
+    """Re-arm the proxy-request alert after a payload update (changed photos)."""
+    cur = conn.execute(
+        "UPDATE listings SET text_only_notified = FALSE WHERE listing_id = ?", (str(listing_id),)
     )
     conn.commit()
     return cur.rowcount > 0
