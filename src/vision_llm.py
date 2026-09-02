@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 
@@ -22,12 +23,15 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get(
     "OLLAMA_MODEL", "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL"
 )
+VLM_ATTEMPTS = max(1, int(os.environ.get("VLM_ATTEMPTS", "3")))
+VLM_IMAGE_MAX_SIDE = max(256, int(os.environ.get("VLM_IMAGE_MAX_SIDE", "1024")))
+VLM_MAX_IMAGES = max(1, int(os.environ.get("VLM_MAX_IMAGES", "8")))
 
 BASE_SYSTEM_PROMPT = """\
 You are an expert real estate auditor analyzing a Rent591 apartment listing.
 You must extract facts from Chinese listing text and analyze all provided images.
 
-Return ONLY a valid JSON object matching this schema:
+Return ONLY a valid JSON object matching this schema (no prose, no code fences):
 {
   "qwen_warnings": ["string warning highlights, e.g. 4th floor walk-up, shared meter"],
   "vision_flags": {
@@ -37,11 +41,22 @@ Return ONLY a valid JSON object matching this schema:
     "has_kitchen_sink": bool,
     "has_exterior_window": bool
   },
-  "predicted_score": float
+  "qwen_direct_score": float
 }
-predicted_score is 1.0 to 5.0 based on the user context rules and overall condition.
+qwen_direct_score is 1.0 to 5.0 based on the user context rules and overall condition.
 If no images are available, set all vision_flags to false and base the score on text only.
 """
+
+DEFAULT_BULLETS = (
+    "- Prioritize dry/wet separation in bathroom.\n"
+    "- Flag shower-sink combo faucet setups."
+)
+
+_RETRY_NOTE = (
+    "Your previous response was not a valid JSON object for the required schema. "
+    "Respond again with ONLY the JSON object described in the system prompt — "
+    "no prose, no code fences, all keys present."
+)
 
 _DEFAULT_FLAGS = {
     "has_bathroom_img": False,
@@ -53,20 +68,23 @@ _DEFAULT_FLAGS = {
 
 
 def construct_full_prompt(bullets: str | None) -> str:
-    dynamic = bullets or (
-        "- Prioritize dry/wet separation in bathroom.\n"
-        "- Flag shower-sink combo faucet setups."
-    )
+    dynamic = (bullets or "").strip() or DEFAULT_BULLETS
     return f"{BASE_SYSTEM_PROMPT}\n\n### User Context & Evolving Preferences ###\n{dynamic}"
 
 
 def _image_b64(path: str) -> str:
+    """Downscale before encode: full-size PNG base64 bloats every Ollama call."""
     from PIL import Image
     with Image.open(path) as raw:
         img = raw.convert("RGB")
-    buf = io.BytesIO()
     try:
-        img.save(buf, "PNG")
+        w, h = img.size
+        m = max(w, h)
+        if m > VLM_IMAGE_MAX_SIDE:
+            scale = VLM_IMAGE_MAX_SIDE / m
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85)
     finally:
         img.close()
     return base64.b64encode(buf.getvalue()).decode()
@@ -93,7 +111,7 @@ def build_messages(listing: dict, image_paths: list[str], bullets: str | None) -
         "Images are attached below (each corresponds to one photo of the property)."
     )
     user_msg: dict = {"role": "user", "content": text}
-    images = [_image_b64(p) for p in image_paths[:8]]
+    images = [_image_b64(p) for p in image_paths[:VLM_MAX_IMAGES] if p]
     if images:
         user_msg["images"] = images
     return [
@@ -140,35 +158,76 @@ def parse_json(text: str) -> dict:
         return {}
 
 
-def _clean_score(raw) -> float:
+def validate_analysis(data) -> dict | None:
+    """Strict schema validation: qwen_warnings list, 5 boolean vision_flags, score 1.0-5.0.
+
+    Returns a normalized {qwen_warnings, vision_flags, qwen_direct_score} dict,
+    or None if the payload is unusable (missing/non-numeric/non-finite score, bad types).
+    """
+    if not isinstance(data, dict):
+        return None
+    score = data.get("qwen_direct_score", data.get("predicted_score"))  # accept legacy key
+    if score is None or isinstance(score, (bool, str)):
+        return None
     try:
-        s = float(raw)
-        return max(1.0, min(5.0, s))
-    except Exception:
-        return 3.0
+        score = float(score)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score):  # json.loads accepts bare NaN/Infinity tokens
+        return None
+    score = max(1.0, min(5.0, score))
+    flags_raw = data.get("vision_flags")
+    if flags_raw is None:
+        flags_raw = {}
+    if not isinstance(flags_raw, dict):
+        return None
+    warnings = data.get("qwen_warnings")
+    if warnings is None:
+        warnings = []
+    if not isinstance(warnings, list):
+        warnings = [str(warnings)]
+    flags = dict(_DEFAULT_FLAGS)
+    for k, v in flags_raw.items():
+        if k in _DEFAULT_FLAGS:
+            flags[k] = bool(v)
+    return {
+        "qwen_warnings": [str(w) for w in warnings],
+        "vision_flags": flags,
+        "qwen_direct_score": score,
+    }
 
 
 def analyze_listing(listing: dict, image_rows: list[dict], bullets: str | None) -> dict | None:
-    """Returns {qwen_warnings, vision_flags, qwen_direct_score} or None on failure."""
+    """Returns {qwen_warnings, vision_flags, qwen_direct_score} or None on failure.
+
+    Retry fallback loop: up to VLM_ATTEMPTS exchanges with a correction message on
+    malformed/invalid JSON, then a final text-only attempt (no images) as fallback.
+    """
     try:
         paths = [r["image_path"] for r in image_rows if r.get("image_path")]
         messages = build_messages(listing, paths, bullets)
-        raw = ask_ollama(messages)
-        data = parse_json(raw)
-        if not data:
-            return None
-        flags = dict(_DEFAULT_FLAGS)
-        flags.update(data.get("vision_flags") or {})
-        for k in _DEFAULT_FLAGS:
-            flags[k] = bool(flags[k])
-        warnings = data.get("qwen_warnings") or []
-        if not isinstance(warnings, list):
-            warnings = [str(warnings)]
-        return {
-            "qwen_warnings": [str(w) for w in warnings],
-            "vision_flags": flags,
-            "qwen_direct_score": _clean_score(data.get("predicted_score", 3.0)),
-        }
+        for attempt in range(1, VLM_ATTEMPTS + 1):
+            try:
+                raw = ask_ollama(messages)
+            except Exception as e:
+                logger.warning("qwen attempt %d/%d endpoint error: %s", attempt, VLM_ATTEMPTS, e)
+                raw = ""
+            data = validate_analysis(parse_json(raw))
+            if data is not None:
+                if attempt > 1:
+                    logger.info("qwen JSON recovered on attempt %d", attempt)
+                return data
+            messages = messages + [
+                {"role": "assistant", "content": (raw or "")[:2000]},
+                {"role": "user", "content": _RETRY_NOTE},
+            ]
+        if paths:
+            logger.warning("qwen malformed after %d attempts -> text-only fallback", VLM_ATTEMPTS)
+            data = validate_analysis(parse_json(ask_ollama(build_messages(listing, [], bullets))))
+            if data is not None:
+                return data
+        logger.warning("qwen analysis failed: no valid JSON after retries")
+        return None
     except Exception as e:
         logger.warning("analyze failed: %s", e)
         return None

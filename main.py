@@ -24,7 +24,15 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src import database, deduplication, ingestion, notifier, scoring, vision_llm  # noqa: E402
+from src import (
+    database,
+    deduplication,
+    dynamic_prompt,
+    ingestion,
+    notifier,
+    scoring,
+    vision_llm,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -86,10 +94,18 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
 
     # DINOv3 embeddings + dedup (exclude this listing's own stored vectors).
     new_vecs = deduplication.embed_image_rows(image_rows)
+    for r in image_rows:
+        r["dino_embedding"] = new_vecs[r["ordinal"]].tobytes() if r["ordinal"] in new_vecs else None
     own_baseline = {lid: v for lid, v in baseline.items() if lid != listing["listing_id"]}
     dup, matched = deduplication.find_duplicate(list(new_vecs.values()), own_baseline, DEDUP_THRESHOLD)
     if dup:
-        logger.info("%s duplicate of %s -> skip", listing["listing_id"], matched)
+        # Persist visual fingerprint + is_duplicate flag, bypass the Qwen vision pass.
+        logger.info("%s duplicate of %s -> is_duplicate=1, skip vision LLM", listing["listing_id"], matched)
+        listing["is_duplicate"] = True
+        listing["dino_embedding"] = deduplication.aggregate_embedding(list(new_vecs.values()))
+        database.upsert_listing(conn, listing)
+        database.replace_images(conn, listing["listing_id"], image_rows)
+        baseline[listing["listing_id"]] = list(new_vecs.values())
         return "duplicate"
 
     # Qwen vision + text.
@@ -101,10 +117,10 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
     listing["qwen_vision_flags"] = analysis["vision_flags"]
     listing["qwen_direct_score"] = analysis["qwen_direct_score"]
 
-    # Scoring.
+    # Scoring. XGBoost was trained on the aggregate embedding — infer on the same feature.
     agg = deduplication.aggregate_embedding(list(new_vecs.values()))
     listing["dino_embedding"] = agg
-    dino_vec = next(iter(new_vecs.values())) if new_vecs else np.zeros(768, dtype=np.float32)
+    dino_vec = np.frombuffer(agg, dtype=np.float32) if agg else np.zeros(768, dtype=np.float32)
     predicted, source = scoring.predict_score(
         conn, dino_vec, analysis["vision_flags"], analysis["qwen_warnings"],
         analysis["qwen_direct_score"],
@@ -112,9 +128,9 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
     listing["predicted_score"] = predicted
     listing["score_source"] = source
 
-    # Store (with per-image vectors).
-    for r in image_rows:
-        r["dino_embedding"] = new_vecs.get(r["ordinal"]).tobytes() if r["ordinal"] in new_vecs else None
+    # Store (per-image vectors already set above). Explicit False clears any
+    # stale flag if this listing's images changed since a previous duplicate run.
+    listing["is_duplicate"] = False
     database.upsert_listing(conn, listing)
     database.replace_images(conn, listing["listing_id"], image_rows)
 
@@ -135,7 +151,7 @@ def run(fixtures: bool, limit: int, do_notify: bool) -> int:
     processed = 0
     try:
         conn = database.connect()
-        bullets = database.get_latest_preferences(conn)
+        bullets = dynamic_prompt.get_bullets(conn)
 
         listings = ingestion.fetch_raw_listings(fixtures=fixtures, limit=limit)
         logger.info("fetched %s listings", len(listings))
@@ -174,7 +190,7 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool) -> int:
     counters = {"stored": 0, "inactive": 0, "duplicate": 0, "failed": 0, "skipped": 0}
     try:
         conn = database.connect()
-        bullets = database.get_latest_preferences(conn)
+        bullets = dynamic_prompt.get_bullets(conn)
         baseline = load_baseline(conn)
 
         paths = sorted(listings_dir.glob("*.json"))

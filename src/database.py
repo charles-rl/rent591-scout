@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS listings (
     url               TEXT,
     status            TEXT,
     is_active         BOOLEAN DEFAULT TRUE,
+    is_duplicate      BOOLEAN DEFAULT FALSE,
     region            TEXT, section TEXT,
     address           TEXT,
     lat REAL, lng REAL,
@@ -80,6 +81,7 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 _EXTRA_COLUMNS = [
     ("social_house", "BOOLEAN"),
     ("facilities", "JSON"),
+    ("is_duplicate", "BOOLEAN DEFAULT FALSE"),
 ]
 
 
@@ -98,6 +100,7 @@ def _json(value):
 def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
     cols = [
         "listing_id", "title", "price", "price_unit", "url", "status", "is_active",
+        "is_duplicate",
         "region", "section", "address", "lat", "lng",
         "community_name", "community_id", "layout", "area", "floor", "shape", "kind_name",
         "deposit", "rent_per", "rent_per_unit", "browse_count", "refresh_time",
@@ -107,13 +110,25 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score",
         "dino_embedding", "predicted_score", "score_source",
     ]
-    placeholders = ", ".join(f":{c}" for c in cols)
+    placeholders = ", ".join(
+        # First insert: never bind a raw NULL — fall back to the stored flag
+        # (inactive re-runs) then FALSE, so is_duplicate is never NULL.
+        "COALESCE(:is_duplicate, (SELECT is_duplicate FROM listings WHERE listing_id = :listing_id), FALSE)"
+        if c == "is_duplicate" else f":{c}"
+        for c in cols
+    )
     # COALESCE keeps previously stored values when this run's payload is degraded
     # (e.g. detail fetch failed), preventing NULL-wipe of lat/tags/scores.
-    sets = ", ".join(f"{c}=COALESCE(excluded.{c}, listings.{c})" for c in cols)
+    sets = ", ".join(
+        "is_duplicate=COALESCE(excluded.is_duplicate, listings.is_duplicate, FALSE)"
+        if c == "is_duplicate" else f"{c}=COALESCE(excluded.{c}, listings.{c})"
+        for c in cols
+    )
     sql = f"INSERT INTO listings ({', '.join(cols)}) VALUES ({placeholders}) " \
           f"ON CONFLICT(listing_id) DO UPDATE SET updated_at=CURRENT_TIMESTAMP, {sets}"
     row = {c: listing.get(c) for c in cols}
+    if row.get("is_duplicate") is not None:
+        row["is_duplicate"] = int(bool(row["is_duplicate"]))
     for j in ("tags", "contain_cost", "raw_search", "raw_metadata", "scraper_raw",
               "qwen_warnings", "qwen_vision_flags", "image_urls", "image_paths",
               "facilities"):
