@@ -13,7 +13,7 @@ Ingestion (mcp-591 API → 591scraper DOM fallback)
     → DINOv3 group-cosine dedup (≥0.95, 768-dim ViT-B/16 CLS embeddings from models/dinov3_cache, offline-capable)
    → Qwen 27B vision + text JSON analysis (Base + Dynamic prompt)
    → Score (Qwen direct ≤20 ratings | XGBoost >20 ratings)
-   → ntfy.sh push if score ≥ 3.5
+   → ntfy.sh push if score ≥ 3.5 (via PC devtunnel when online, see hybrid mode)
    → SQLite storage + CLI feedback → dynamic preference prompt retrain
 ```
 
@@ -37,13 +37,43 @@ GitHub runner (can reach 591)                    GPU server (591 blocked)
 Payloads land in `data/incoming/listings/<id>.json` + `data/incoming/images/<id>/*.webp`
 (shipped in-git; `.gitignore` un-ignores `data/incoming/`). Per-listing `payload_sha256`
 plus a `relay_state` table make both sides idempotent: the runner skips unchanged
-payloads (no commit churn), the server skips already-processed hashes. `--incoming`
-makes **zero** outbound calls to 591/CDN/ntfy (verified with `HTTPS_PROXY` pointed at a
-blackhole); notifications are off by default in this mode.
+payloads (no commit churn), the server skips already-processed hashes. Text payloads
+usually arrive **without** images (`images: []`) — photos are fetched by the GPU
+server itself through the PC proxy bridge described next.
 
-> Live status: 591's WAF intermittently 403s GitHub's shared runner IPs and its image
-> CDN blocks datacenter IPs outright — JSON relay works on unblocked IPs (proven),
-> images need a self-hosted runner. Details: `docs/rent591-network-access.md`.
+### Hybrid PC-proxy mode (devtunnel)
+
+The personal PC runs a local HTTP proxy (port `8999`) bridged to the GPU server as
+`127.0.0.1:8999` via `devtunnel host`. Each `python main.py --incoming` run:
+
+1. **Text ingestion (always, zero egress):** payloads stored in SQLite with
+   `image_status='pending'` + rule-based text warnings (floor / utilities / pricing).
+2. **Proxy probe** (`src/utils/proxy_check.py`): GET `www.591.com.tw` through the
+   tunnel — HTTP 200 means the PC is online.
+3. **LIVE** → `src/utils/image_queue.py` drains all pending listings through the
+   proxy (WebP q85 → `data/images/`), then each completed listing runs DINOv3
+   dedup → Qwen vision → XGBoost; match alerts (score ≥ `SCORE_THRESHOLD`) push to
+   ntfy **via the tunnel**.
+4. **OFFLINE** → listings stay queued and one ntfy "connect PC proxy" alert is sent
+   per batch (`text_only_notified` flag prevents spam; re-armed on payload change).
+
+Details & gotchas:
+- 591's CDN serves **403** for stripped original photo URLs through the tunnel; the
+  queue requests resize variants instead (`PROXY_IMAGE_SUFFIX`, default
+  `!fit.1000x.water2.jpg` ≈ 1000px, watermarked, served as WebP — ample for DINOv3/Qwen).
+- devtunnel MITMs TLS with its own cert chain, which Python's OpenSSL rejects
+  (`Missing Subject Key Identifier`) → proxy traffic uses `verify=False`
+  (`PROXY_SSL_VERIFY=1` to re-enable once the tunnel CA is installed).
+- CDN 502 storms are treated as **throttling**, not a dead PC: the listing stays
+  `pending`, the drainer backs off (`PROXY_RATE_LIMIT_BACKOFF`) and resumes the
+  next run; only true connection failures stop the drain.
+- ntfy delivery is **tunnel-first with direct fallback** for every alert (match +
+  proxy-request). When the PC is fully powered off there is no network path at
+  that moment — the alert is best-effort by design; the queue and DB state persist.
+- Listings stuck `completed` but unscored (Ollama was down) are retried every run.
+- `listings.image_status` lifecycle: `pending → completed | failed | skipped`
+  (skipped = inactive or no photos). The migration requeues legacy rows whose photo
+  files are missing or solid-color placeholders from old `PLACEHOLDER_IMAGES=1` runs.
 
 ## Setup
 
@@ -59,11 +89,18 @@ Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=`,
 `OLLAMA_BASE_URL=http://localhost:11434`,
 `OLLAMA_MODEL=hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`, `SCORE_THRESHOLD=3.5`.
 
+Hybrid proxy mode (see above): `PROXY_URL=http://127.0.0.1:8999`,
+`PROXY_PROBE_URL=https://www.591.com.tw/`, `PROXY_SSL_VERIFY=0`,
+`PROXY_IMAGE_SUFFIX=!fit.1000x.water2.jpg`, `PROXY_DOWNLOAD_TIMEOUT=30`,
+`PROXY_RATE_LIMIT_BACKOFF=20`, `PROXY_RATE_LIMIT_MAX_STREAK=3`,
+`PLACEHOLDER_MAX_BYTES=4096`.
+
 ## Usage
 
 ```bash
 python main.py                    # live run
-python main.py --incoming         # offline run over GitHub relay payloads (data/incoming/)
+python main.py --incoming         # hybrid run over relay payloads: text always; images +
+                                  # vision + alerts via PC devtunnel proxy when online
 python main.py --fixtures --limit 3   # offline test with captured fixtures
 python main.py --train            # train XGBoost head from rated rows
 python rate.py --id 21103645 --score 4 --bathroom 4 --comment "dry-wet separation preferred"
@@ -81,6 +118,10 @@ gh workflow run scrape_relay.yml
   end-to-end testing against captured responses in `external/mcp-591/tests/fixtures`.
 - Live runs honor `HTTPS_PROXY`/`HTTP_PROXY` automatically (requests `trust_env=True`).
   On a restricted host, export a forward proxy that can reach 591 before running.
+- All ntfy pushes are tunnel-first with direct fallback (`src/notifier.py`): the GPU
+  server cannot reach `ntfy.sh` directly, but the PC devtunnel path returns 200 while
+  the PC is online. The offline "connect the proxy" alert can only be delivered when
+  the tunnel is partially alive — a fully-off PC means no egress path, by design.
 - DrissionPage is non-commercial licensed. See `docs/` for full analysis.
 - **DINOv3 dedup:** feature extraction uses Meta DINOv3 ViT-B/16 (`dinov3-vit-base`). Weights are cached under
   `models/dinov3_cache/` (offline after initial pull; set `HF_HUB_OFFLINE=1` to force). The extractor emits

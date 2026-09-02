@@ -326,7 +326,9 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
             pending_alerts = database.count_pending_unnotified(conn)
             if pending_alerts:
                 logger.info("%d pending listings -> proxy request alert", pending_alerts)
-                notifier.send_proxy_request_alert(pending_alerts)
+                # Tunnel-first: the probe may fail on 591 while the devtunnel
+                # itself still relays ntfy fine; _post falls back to direct.
+                notifier.send_proxy_request_alert(pending_alerts, proxy=PROXY_URL)
                 database.mark_text_only_notified(conn)
 
         # Self-heal: images completed earlier whose vision pass never ran.

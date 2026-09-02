@@ -19,17 +19,26 @@ def _header_safe(value: str) -> str:
 
 
 def _post(message: str, headers: dict, proxy: str | None = None) -> bool:
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.post(
-            f"{NTFY_URL}/{NTFY_TOPIC}", data=message.encode("utf-8"),
-            headers=headers, timeout=15, proxies=proxies,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.warning("ntfy push failed: %s", e)
-        return False
+    """POST to ntfy. With a proxy configured: tunnel-first, then direct fallback.
+
+    The devtunnel path is the only way to reach ntfy.sh from the GPU server
+    while the PC is up; the direct fallback covers the probe-said-live-but-
+    tunnel-died race. When the PC is truly powered off neither path can
+    deliver — the alert is best-effort by design (the queue persists).
+    """
+    attempts = [proxy, None] if proxy else [None]
+    for px in attempts:
+        try:
+            resp = requests.post(
+                f"{NTFY_URL}/{NTFY_TOPIC}", data=message.encode("utf-8"),
+                headers=headers, timeout=15,
+                proxies={"http": px, "https": px} if px else None,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.warning("ntfy push failed via %s: %s", px or "direct", e)
+    return False
 
 
 def send_ntfy_alert(listing: dict, predicted_score: float | None = None, threshold: float = 3.5,

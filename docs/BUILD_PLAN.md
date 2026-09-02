@@ -103,3 +103,26 @@ Execution spec for the Build agent. All paths relative to repo root `/root/rent5
 - `python rate.py --id <fixture_id> --score 4 --comment "..."` updates DB + writes new dynamic_preferences row.
 - `python main.py --fixtures --train` trains model from rated rows.
 - Lint: `python -m pyflakes src/ main.py rate.py` clean (pyflakes installed via nexus proxy).
+
+## Session 8 — Hybrid PC-proxy mode + ntfy tunnel routing + placeholder repair
+- Schema: `listings.image_status` (pending|completed|failed|skipped) +
+  `text_only_notified`; `_ensure_columns` migration includes a **backfill** (ALTER
+  DEFAULT would mark the whole legacy corpus 'pending') and a `_requeue_missing_image_files`
+  pass that requeues 'completed' rows whose photo files are absent or solid-color
+  `PLACEHOLDER_IMAGES=1` residue (601 fake 1KB WebPs wiped + re-downloaded real).
+- `src/utils/proxy_check.py`: tunnel liveness = HTTP 200 via proxy to
+  `PROBE_URL` (default `www.591.com.tw`; img* roots 403 → unusable as probe).
+- `src/utils/image_queue.py`: pending drain via proxy session (Referer hotlink,
+  `PROXY_IMAGE_SUFFIX` resize variants, WebP q85, `looks_placeholder()` cache guard).
+  Error taxonomy: HTTPError 403/404 → image-level; RetryError/Timeout → throttling
+  (stay pending, back off, ≤`RATE_LIMIT_MAX_STREAK` streak then resume next run);
+  ProxyError/SSLError/ConnectionError → PC offline → stop drain mid-run.
+- `main.py`: `run_incoming` = text phase (always; `extract_text_warnings` rules) →
+  probe → LIVE: drain + `finalize_listing` (dedup→Qwen→XGBoost, alerts via proxy,
+  auto-on) / OFFLINE: single `send_proxy_request_alert(n, proxy=...)`. Shared
+  `finalize_listing()` reused by the live path. Self-heal: completed-but-unscored
+  retried each run.
+- `src/notifier.py`: `_post` tunnel-first + direct fallback for every alert;
+  `send_ntfy_alert(..., proxy=)`, `send_proxy_request_alert(count, proxy=)`.
+- Verified: 57 pytest; live smoke + full prod repair (53 listings re-downloaded
+  through the tunnel, DINOv3 + Qwen re-scored; alerts suppressed with --no-notify).

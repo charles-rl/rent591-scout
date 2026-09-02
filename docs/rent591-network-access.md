@@ -160,3 +160,28 @@ Conclusions:
     591-reachable network (change `runs-on:` to `[self-hosted, 591-relay]`). The
     rest of the pipeline (git relay → `main.py --incoming` offline inference) is
     unchanged.
+
+## Update 2026-09 — PC devtunnel proxy bridge (hybrid mode, shipped)
+
+The self-hosted-runner gap is closed differently: the personal PC runs an HTTP proxy
+(port 8999) bridged to the GPU server as `127.0.0.1:8999` via `devtunnel host`.
+Verified against the live tunnel:
+
+- `www.591.com.tw` → 200 (used as the availability probe); `img*.591.com.tw` bare
+  originals → 403 through the tunnel, resize variants `...jpg!fit.1000x.water2.jpg`
+  → 200 (`image/webp`) — the image queue rewrites URLs accordingly.
+- TLS through the tunnel is MITM'd by the devtunnel cert; Python's OpenSSL rejects
+  it (`Missing Subject Key Identifier`) → proxy paths set `verify=False`
+  (`PROXY_SSL_VERIFY=1` overrides; install the tunnel CA to re-enable properly).
+- `ntfy.sh`: blocked **direct** (IP DROP, confirmed), **200 via the tunnel** → all
+  pushes are tunnel-first with direct fallback (`src/notifier.py`).
+- PC offline (`is_proxy_available()` non-200/exception): text ingestion continues;
+  listings queue with `image_status='pending'` and one anti-spam ntfy alert
+  (`text_only_notified`) asks the user to bring the tunnel up. When the PC is fully
+  powered off there is no egress path for that alert either — delivery is
+  best-effort; the queue persists and drains on the next online run.
+
+Implementation: `src/utils/proxy_check.py`, `src/utils/image_queue.py`,
+`main.py::run_incoming` (hybrid phases), `listings.image_status` /
+`listings.text_only_notified` columns (+ placeholder-repair migration).
+README "Hybrid PC-proxy mode (devtunnel)" is the operator doc.

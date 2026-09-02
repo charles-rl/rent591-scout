@@ -55,7 +55,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(main.deduplication, "embed_image_rows", lambda rows: {})
     calls = {"proxy_alert": [], "ntfy": []}
     monkeypatch.setattr(main.notifier, "send_proxy_request_alert",
-                        lambda n, proxy=None: calls["proxy_alert"].append(n) or True)
+                        lambda n, proxy=None: calls["proxy_alert"].append((n, proxy)) or True)
     monkeypatch.setattr(main.notifier, "send_ntfy_alert",
                         lambda listing, predicted=None, threshold=3.5, proxy=None:
                         calls["ntfy"].append((str(listing["listing_id"]), predicted, proxy)) or True)
@@ -92,12 +92,12 @@ def test_offline_stores_pending_and_alerts_once(env):
     assert bool(row["text_only_notified"]) is True
     warnings = json.loads(row["qwen_warnings"])
     assert any("頂樓" in x for x in warnings) and any("水電" in x for x in warnings)
-    assert env["calls"]["proxy_alert"] == [1]
+    assert env["calls"]["proxy_alert"] == [(1, PROXY)]  # tunnel-first delivery
     assert env["calls"]["ntfy"] == []
 
     # Re-run over the same payloads: sha-skipped, pending already notified -> no alert spam.
     assert main.run_incoming(env["incoming"], -1, do_notify=False) == 0
-    assert env["calls"]["proxy_alert"] == [1]
+    assert env["calls"]["proxy_alert"] == [(1, PROXY)]
 
 
 def test_online_local_images_complete_and_notify_via_proxy(env):
