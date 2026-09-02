@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -35,6 +36,10 @@ PROXY_IMAGE_SUFFIX = os.environ.get("PROXY_IMAGE_SUFFIX", "!fit.1000x.water2.jpg
 VERIFY_SSL = os.environ.get("PROXY_SSL_VERIFY", "0").lower() in ("1", "true", "yes")
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 DOWNLOAD_TIMEOUT = int(os.environ.get("PROXY_DOWNLOAD_TIMEOUT", "30"))
+# CDN/tunnel throttling (502 storms): back off instead of treating it as a
+# dead proxy, and stop politely so the next cron pass resumes where we left off.
+RATE_LIMIT_BACKOFF = int(os.environ.get("PROXY_RATE_LIMIT_BACKOFF", "20"))
+RATE_LIMIT_MAX_STREAK = int(os.environ.get("PROXY_RATE_LIMIT_MAX_STREAK", "3"))
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -122,12 +127,14 @@ def _download_one(session: requests.Session, url: str, dest: Path) -> bool:
     return True
 
 
-def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[dict], bool]:
+def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[dict], str | None]:
     """Drain one pending listing's images.
 
-    Returns (outcome, image_rows, tunnel_down). Outcome is 'completed' or
+    Returns (outcome, image_rows, stop_reason). Outcome is 'completed' or
     'skipped' (ready for the vision pass), 'failed', or 'pending' (left in
-    queue). tunnel_down signals the proxy died mid-drain -> stop the run.
+    queue). stop_reason: 'tunnel_down' (PC offline -> stop the run),
+    'rate_limited' (CDN 5xx exhaustion -> caller backs off and continues),
+    or None.
     """
     lid = str(row["listing_id"])
     try:
@@ -137,19 +144,30 @@ def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[di
     if not urls:
         # Nothing to download: text-only listing, straight to vision.
         database.set_image_status(conn, lid, "skipped")
-        return "skipped", [], False
+        return "skipped", [], None
 
     out_dir = IMAGES_DIR / lid
     rows: list[dict] = []
     ok_count = 0
-    tunnel_down = False
+    stop_reason: str | None = None
     for ordinal, url in enumerate(urls):
         dest = out_dir / f"{ordinal:02d}.webp"
         try:
             ok = _download_one(session, url, dest)
-        except requests.RequestException as e:
+        except requests.exceptions.RetryError as e:
+            # CDN/tunnel exhaustion (e.g. "too many 502") — the proxy is alive
+            # but throttling; leave pending and let the caller back off.
+            logger.warning("rate-limited mid-download of %s/%s: %s -> leaving pending", lid, ordinal, e)
+            stop_reason = "rate_limited"
+            break
+        except (requests.exceptions.ProxyError, requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError) as e:
             logger.warning("proxy transport failure on %s/%s: %s", lid, ordinal, e)
-            tunnel_down = True
+            stop_reason = "tunnel_down"
+            break
+        except requests.Timeout as e:
+            logger.warning("proxy timeout on %s/%s: %s -> leaving pending", lid, ordinal, e)
+            stop_reason = "rate_limited"
             break
         if ok:
             ok_count += 1
@@ -157,21 +175,19 @@ def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[di
         else:
             rows.append({"ordinal": ordinal, "image_url": url, "image_path": None})
 
-    if tunnel_down:
-        # PC powered off mid-drain: keep 'pending', stop the whole queue run.
-        logger.warning("tunnel died mid-download of %s -> leaving %s pending", lid, lid)
-        return "pending", [], True
+    if stop_reason:
+        return "pending", [], stop_reason
     if ok_count == 0:
         logger.warning("%s: all %d image downloads failed -> image_status=failed", lid, len(urls))
         database.set_image_status(conn, lid, "failed")
-        return "failed", [], False
+        return "failed", [], None
 
     for r in rows:
         r.setdefault("dino_embedding", None)
     database.replace_images(conn, lid, rows)
     database.set_image_status(conn, lid, "completed", image_paths=[r["image_path"] for r in rows])
     logger.info("%s: %d/%d images downloaded -> image_status=completed", lid, ok_count, len(urls))
-    return "completed", rows, False
+    return "completed", rows, None
 
 
 def process_pending_images(conn, proxy_url: str = DEFAULT_PROXY_URL) -> list[tuple[str, list[dict]]]:
@@ -187,15 +203,25 @@ def process_pending_images(conn, proxy_url: str = DEFAULT_PROXY_URL) -> list[tup
     logger.info("image queue: %d pending listings via %s", len(pending), proxy_url)
     session = _make_session(proxy_url)
     results: list[tuple[str, list[dict]]] = []
+    throttle_streak = 0
     for row in pending:
         try:
-            outcome, rows, tunnel_down = _process_listing(conn, row, session)
+            outcome, rows, stop_reason = _process_listing(conn, row, session)
         except Exception:
             logger.exception("image drain failed for %s -> image_status=failed", row["listing_id"])
             database.set_image_status(conn, str(row["listing_id"]), "failed")
             continue
         if outcome in ("completed", "skipped"):
             results.append((str(row["listing_id"]), rows))
-        if tunnel_down:
+            throttle_streak = 0
+        elif stop_reason == "rate_limited":
+            throttle_streak += 1
+            if throttle_streak >= RATE_LIMIT_MAX_STREAK:
+                logger.warning("throttled %d listings in a row -> stopping; resumes next run",
+                               throttle_streak)
+                break
+            logger.info("rate limited -> backing off %ss", RATE_LIMIT_BACKOFF)
+            time.sleep(RATE_LIMIT_BACKOFF)
+        elif stop_reason == "tunnel_down":
             break
     return results

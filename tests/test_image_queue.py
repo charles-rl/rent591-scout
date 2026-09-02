@@ -43,6 +43,8 @@ class FakeSession:
         self.requested.append(url)
         if self.mode == "down":
             raise requests.ConnectionError("tunnel down")
+        if self.mode == "ratelimit":
+            raise requests.exceptions.RetryError("too many 502 error responses")
         if self.mode == "notfound":
             return _Resp(b"", status_code=404)
         if self.mode == "partial" and url.endswith("bbb.jpg" + image_queue.PROXY_IMAGE_SUFFIX):
@@ -106,6 +108,17 @@ def test_tunnel_down_leaves_pending(queue_db):
     results = _run(queue_db, FakeSession("down"))
     assert results == []
     row = queue_db.execute("SELECT image_status FROM listings WHERE listing_id='9004'").fetchone()
+    assert row["image_status"] == "pending"
+
+
+def test_rate_limit_leaves_pending_and_continues_next_listing(queue_db, monkeypatch):
+    """502 exhaustion (proxy alive but throttling) must NOT be treated as PC offline."""
+    monkeypatch.setattr(image_queue, "RATE_LIMIT_BACKOFF", 0)
+    _seed(queue_db, "9007", IMG_URLS)   # 502 mid-drain -> stays pending
+    _seed(queue_db, "9008", [])          # still processed (skipped) -> proves loop continued
+    results = _run(queue_db, FakeSession("ratelimit"))
+    assert results == [("9008", [])]
+    row = queue_db.execute("SELECT image_status FROM listings WHERE listing_id='9007'").fetchone()
     assert row["image_status"] == "pending"
 
 
