@@ -169,6 +169,22 @@ def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def get_scoring_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score "
+        "FROM listings WHERE IFNULL(user_rated, 0) != 1"
+    ).fetchall()
+
+
+def set_predicted_scores(conn: sqlite3.Connection, updates: list[tuple[str, float, str]]) -> int:
+    conn.executemany(
+        "UPDATE listings SET predicted_score=?, score_source=?, updated_at=CURRENT_TIMESTAMP WHERE listing_id=?",
+        [(score, source, listing_id) for listing_id, score, source in updates],
+    )
+    conn.commit()
+    return len(updates)
+
+
 def get_listing_ids(conn: sqlite3.Connection) -> list[str]:
     return [r[0] for r in conn.execute("SELECT listing_id FROM listings")]
 

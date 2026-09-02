@@ -253,8 +253,15 @@ def main() -> None:
 
     if args.train:
         conn = database.connect()
-        scoring.train_and_save(conn)
-        conn.close()
+        try:
+            scoring.train_and_save(conn)
+            backfilled = scoring.score_all_unrated(conn)
+            logger.info("--train: backfilled predicted_score for %d unrated listings", backfilled)
+        except RuntimeError as e:
+            logger.error("--train aborted: %s", e)
+            sys.exit(1)
+        finally:
+            conn.close()
         return
 
     # ntfy.sh is blocked from the GPU server; --incoming defaults to no notifications.
