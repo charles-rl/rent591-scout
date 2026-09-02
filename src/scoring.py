@@ -1,8 +1,11 @@
-"""Cold-start router + XGBoost scoring head.
+"""Layer 3: feature fusion + XGBoost scoring head.
 
 Phase 1 (<=RATED_THRESHOLD labeled samples): predicted_score = qwen_direct_score.
-Phase 2 (>RATED_THRESHOLD): XGBRegressor over [DINO 768-d embedding; binary flags] -> user_score.
-Feature vector layout: 768 float32 DINOv3 dims + 5 vision flags + 1 has-warnings bit (774).
+Phase 2 (>RATED_THRESHOLD): XGBRegressor over the compressed fusion vector -> user_score:
+[dino_visual_score (Layer 1 scalar); qwen_score = (qwen_direct_score-1)/4;
+5 vision flags + 1 has-warnings bit; tabular: log1p price / area_ping / price_per_ping /
+floor_num; HIGH_ELEC_FEE; MANUAL_TRASH] (FEATURE_NAMES). The raw 768-d DINOv3 vector is
+compressed to dino_visual_score by src/visual_preference.py, never concatenated directly.
 
 Also hosts the Stage-3 deterministic penalty engine (docs/591research.md §4):
 baseline 100 minus regex-extracted red flags. Penalties fire only on positive
@@ -74,14 +77,78 @@ def _load_json(raw, default):
         return default
 
 
-def _row_features(row) -> np.ndarray:
+FEATURE_NAMES = [
+    "dino_visual_score", "qwen_score",
+    "has_bathroom_img", "shower_sink_combo", "drainage_risk", "has_kitchen_sink",
+    "has_exterior_window", "has_warnings",
+    "log_price", "area_ping", "price_per_ping", "floor_num",
+    "HIGH_ELEC_FEE", "MANUAL_TRASH",
+]
+
+
+def _num(value) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if np.isfinite(f) else 0.0
+
+
+def parse_floor_number(floor) -> float:
+    """'12樓' / '5' / 'B1' -> leading floor number as float; basement/unknown -> 0."""
+    m = re.search(r"\d+", str(floor or ""))
+    if not m:
+        return 0.0
+    n = int(m.group(0))
+    return -float(n) if "地" in str(floor) or str(floor).strip().upper().startswith("B") else float(n)
+
+
+def normalize_qwen(qwen_direct_score) -> float:
+    """Layer 2 score on the native 1-5 scale compressed to qwen_score in [0,1]; neutral 0.5 when absent."""
+    if qwen_direct_score is None:
+        return 0.5
+    return float(np.clip((_num(qwen_direct_score) - 1.0) / 4.0, 0.0, 1.0))
+
+
+def tabular_vector(listing: dict | None) -> np.ndarray:
+    listing = listing or {}
+    price = _num(listing.get("price"))
+    area = _num(listing.get("area"))
+    per_ping = price / area if area > 0 else 0.0
+    penalty_flags = set(heuristic_penalties(listing))
+    vec = [
+        float(np.log1p(price)),
+        area,
+        per_ping,
+        parse_floor_number(listing.get("floor")),
+        1.0 if "HIGH_ELEC_FEE" in penalty_flags else 0.0,
+        1.0 if "MANUAL_TRASH" in penalty_flags else 0.0,
+    ]
+    return np.asarray(vec, dtype=np.float32)
+
+
+def fusion_vector(visual_score: float, qwen_direct_score, flags: dict | None,
+                  warnings: list | None, listing: dict | None) -> np.ndarray:
+    """Layer 1 scalar + Layer 2 scalar + vision flags + tabular metadata -> XGB input."""
+    return np.concatenate([
+        np.asarray([visual_score, normalize_qwen(qwen_direct_score)], dtype=np.float32),
+        flag_vector(flags, warnings),
+        tabular_vector(listing),
+    ])
+
+
+def _row_listing(row) -> dict:
+    return {
+        "price": row["price"], "area": row["area"], "floor": row["floor"],
+        "shape": row["shape"], "tags": _load_json(row["tags"], []),
+        "description": row["description"],
+    }
+
+
+def _row_features(row, visual_score: float) -> np.ndarray:
     flags = _load_json(row["qwen_vision_flags"], {})
     warnings = _load_json(row["qwen_warnings"], [])
-    return np.concatenate([_as_embedding(row["dino_embedding"]), flag_vector(flags, warnings)])
-
-
-def _features(dino_blob, flags, warnings) -> np.ndarray:
-    return np.concatenate([_as_embedding(dino_blob), flag_vector(flags, warnings)])
+    return fusion_vector(visual_score, row["qwen_direct_score"], flags, warnings, _row_listing(row))
 
 
 def _load_trained_model(conn) -> xgb.XGBRegressor:
@@ -93,15 +160,19 @@ def _load_trained_model(conn) -> xgb.XGBRegressor:
 
 
 def predict_score(conn, dino_vec: np.ndarray, flags: dict, warnings: list,
-                  qwen_direct_score: float) -> tuple[float, str]:
+                  qwen_direct_score: float, listing: dict | None = None) -> tuple[float, str]:
+    """Return (predicted_score 1-5, score_source 'qwen'|'xgboost')."""
+    from . import visual_preference
+
     rated = database.get_rating_count(conn)
     if rated <= RATED_THRESHOLD:
         return float(qwen_direct_score), "qwen"
 
     model = None
     try:
+        visual = visual_preference.VisualScorer.for_conn(conn).score(_as_embedding(dino_vec))
         model = _load_trained_model(conn)
-        vec = np.concatenate([_as_embedding(dino_vec), flag_vector(flags, warnings)])
+        vec = fusion_vector(visual, qwen_direct_score, flags, warnings, listing)
         pred = float(model.predict(vec.reshape(1, -1))[0])
         return max(1.0, min(5.0, pred)), "xgboost"
     except Exception:
@@ -114,17 +185,24 @@ def predict_score(conn, dino_vec: np.ndarray, flags: dict, warnings: list,
 
 def score_all_unrated(conn) -> int:
     """Batch-score unrated listings and persist predicted_score/score_source to the DB."""
+    from . import visual_preference
+
     rows = database.get_scoring_rows(conn)
     if not rows:
         return 0
 
     rated = database.get_rating_count(conn)
+    matured = rated > RATED_THRESHOLD
+    # Layer 1 scalars are produced in both phases (centroid cold / probe matured).
+    scorer = visual_preference.VisualScorer.for_conn(conn)
     preds: dict[str, float] = {}
     model = None
-    if rated > RATED_THRESHOLD:
+    if matured:
         try:
             model = _load_trained_model(conn)
-            X = np.stack([_row_features(r) for r in rows])
+            X = np.stack([
+                _row_features(r, scorer.score(_as_embedding(r["dino_embedding"]))) for r in rows
+            ])
             preds = {r["listing_id"]: float(p) for r, p in zip(rows, model.predict(X))}
         except Exception:
             logger.exception("xgboost batch scoring failed -> falling back to qwen scores")
@@ -141,6 +219,10 @@ def score_all_unrated(conn) -> int:
             updates.append((r["listing_id"], float(r["qwen_direct_score"]), "qwen"))
     if updates:
         database.set_predicted_scores(conn, updates)
+    database.set_preference_scores(conn, [
+        (r["listing_id"], scorer.score(_as_embedding(r["dino_embedding"])), normalize_qwen(r["qwen_direct_score"]))
+        for r in rows
+    ])
     logger.info("scored %d unrated listings", len(updates))
     return len(updates)
 
@@ -210,11 +292,29 @@ def compute_heuristic_score(listing: dict) -> tuple[float, list[str]]:
 
 
 def train_and_save(conn) -> None:
+    """Train the Layer-3 XGBoost head on fusion vectors (Layer-1 probe trained alongside)."""
+    from . import visual_preference
+
     rows = database.get_rated_samples(conn)
     if not rows:
         raise RuntimeError("no rated samples to train on")
-    X = np.stack([_row_features(r) for r in rows])
     y = np.asarray([float(r["user_score"]) for r in rows], dtype=np.float32)
+
+    visual_probe = None
+    try:
+        visual_probe = visual_preference.fit_probe(conn)
+        visual_preference.save_probe(*visual_probe)
+    except Exception:
+        logger.exception("Layer-1 probe training failed; falling back to liked centroid features")
+    centroid = None if visual_probe else visual_preference.liked_centroid(conn)
+
+    def visual_of(row) -> float:
+        vec = _as_embedding(row["dino_embedding"])
+        if visual_probe:
+            return visual_preference.probe_value(vec, *visual_probe)
+        return visual_preference.centroid_score(vec, centroid)
+
+    X = np.stack([_row_features(r, visual_of(r)) for r in rows])
     model = xgb.XGBRegressor(max_depth=3, n_estimators=50, learning_rate=0.1)
     try:
         model.fit(X, y)
@@ -222,6 +322,10 @@ def train_and_save(conn) -> None:
         tmp = MODEL_PATH.with_suffix(".tmp.json")
         model.save_model(str(tmp))
         tmp.replace(MODEL_PATH)
+        database.set_preference_scores(conn, [
+            (row["listing_id"], visual_of(row), normalize_qwen(row["qwen_direct_score"]))
+            for row in rows
+        ])
         logger.info("trained and saved %s on %d rated samples", MODEL_PATH, len(y))
     finally:
         del model, X, y

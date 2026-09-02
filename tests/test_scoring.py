@@ -1,9 +1,9 @@
-"""Session 5: adaptive scoring router + XGBoost head tests (offline, temp DBs only)."""
+"""Session 5: adaptive scoring router + Layer-3 fusion XGBoost head tests (offline, temp DBs)."""
 
 import numpy as np
 import pytest
 
-from src import database, scoring
+from src import database, scoring, visual_preference
 
 FLAGS_A = {"has_bathroom_img": True, "shower_sink_combo": False, "drainage_risk": True,
            "has_kitchen_sink": True, "has_exterior_window": False}
@@ -12,38 +12,61 @@ FLAGS_B = {k: False for k in scoring._FLAG_ORDER}
 
 @pytest.fixture(autouse=True)
 def isolated_model(tmp_path, monkeypatch):
-    """Never touch the real models/xgboost_head.json during tests; pin router threshold."""
+    """Never touch the real models/ artifacts during tests; pin router threshold."""
     monkeypatch.setattr(scoring, "MODEL_PATH", tmp_path / "xgboost_head.json")
     monkeypatch.setattr(scoring, "RATED_THRESHOLD", 20)
+    monkeypatch.setattr(visual_preference, "PROBE_PATH", tmp_path / "dino_probe.npz")
+
+
+def _axis(*idx) -> np.ndarray:
+    v = np.zeros(scoring.EMBED_DIM, dtype=np.float32)
+    for i in idx:
+        v[i] = 1.0
+    return v / np.linalg.norm(v)
+
+
+BASE_LIKE = _axis(0, 1)
+BASE_DISLIKE = _axis(2, 3)
 
 
 def _embedding(rng, scale=1.0) -> bytes:
     return (rng.standard_normal(scoring.EMBED_DIM).astype(np.float32) * scale).tobytes()
 
 
-def _seed_listing(conn, lid, *, emb, flags, warnings=None, qwen=3.0, rated=None):
+def _structured(rng, base) -> bytes:
+    v = base + rng.standard_normal(scoring.EMBED_DIM).astype(np.float32) * 0.01
+    return (v / np.linalg.norm(v)).astype(np.float32).tobytes()
+
+
+def _seed_listing(conn, lid, *, emb, flags, warnings=None, qwen=3.0, rated=None, **tabular):
     database.upsert_listing(conn, {
         "listing_id": lid, "title": lid,
         "dino_embedding": emb,
         "qwen_vision_flags": flags,
         "qwen_warnings": warnings or [],
         "qwen_direct_score": qwen,
+        **tabular,
     })
     if rated is not None:
         assert database.rate_listing(conn, lid, rated)
 
 
-def _seed_labeled_set(conn, n, seed=7):
-    rng = np.random.default_rng(seed)
+def _seed_labeled_set(conn, n):
+    """Half hot / half cold. All embeddings are identical (Layer 1 carries no class
+    signal), so the tree must split on the robust qwen_score/flag margins — Layer-1
+    discriminative power is unit-tested in tests/test_visual_preference.py instead."""
     for i in range(n):
         hot = i % 2 == 0
+        # Varied qwen/rating inside each class keeps the split margin wide instead of
+        # razor-edged at a single value.
+        score = (4.5 if i % 4 == 0 else 4.0) if hot else (1.5 if i % 4 == 0 else 2.0)
         _seed_listing(
             conn, f"R{i}",
-            emb=_embedding(rng, scale=1.0 if hot else 0.5),
+            emb=BASE_LIKE.astype(np.float32).tobytes(),
             flags=FLAGS_A if hot else FLAGS_B,
             warnings=["dirty grout"] if hot else [],
-            qwen=4.5 if hot else 1.5,
-            rated=4.5 if hot else 1.5,
+            qwen=score,
+            rated=score,
         )
 
 
@@ -53,9 +76,31 @@ def test_flag_vector_layout_and_dim():
     assert vec.dtype == np.float32
     assert vec.tolist() == [1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
     assert scoring.flag_vector({}, []).tolist() == [0.0] * 6
-    feats = scoring._features(_embedding(np.random.default_rng(0)), {"has_kitchen_sink": 1}, None)
-    assert feats.shape == (scoring.EMBED_DIM + 6,)
-    assert feats[scoring.EMBED_DIM + 2] == 0.0  # drainage_risk position preserved
+
+
+def test_fusion_vector_layout():
+    listing = {"price": 12000, "area": 8.0, "floor": "5樓", "shape": "公寓",
+               "description": "電費6元/度，需追垃圾車"}
+    vec = scoring.fusion_vector(0.7, 3.0, FLAGS_A, ["w"], listing)
+    assert vec.shape == (len(scoring.FEATURE_NAMES),) == (14,)
+    assert vec[0] == pytest.approx(0.7)                      # dino_visual_score
+    assert vec[1] == pytest.approx(0.5)                      # qwen_score = (3-1)/4
+    np.testing.assert_allclose(vec[2:8], scoring.flag_vector(FLAGS_A, ["w"]))
+    assert vec[8] == pytest.approx(np.log1p(12000), abs=1e-4)
+    assert vec[9] == pytest.approx(8.0)
+    assert vec[10] == pytest.approx(1500.0)                  # price per ping
+    assert vec[11] == pytest.approx(5.0)
+    assert vec[12] == 1.0 and vec[13] == 1.0                 # HIGH_ELEC_FEE / MANUAL_TRASH
+    empty = scoring.fusion_vector(0.0, None, None, None, None)
+    assert empty.shape == (14,) and empty[1] == pytest.approx(0.5)  # neutral qwen_score
+
+
+def test_parse_floor_number():
+    assert scoring.parse_floor_number("5樓") == 5.0
+    assert scoring.parse_floor_number(3) == 3.0
+    assert scoring.parse_floor_number("地下2樓") == -2.0
+    assert scoring.parse_floor_number("B1") == -1.0
+    assert scoring.parse_floor_number(None) == 0.0
 
 
 def test_as_embedding_pads_and_truncates():
@@ -99,10 +144,12 @@ def test_xgboost_trains_on_22_samples_and_predicts(tmp_path):
 
     scoring.train_and_save(conn)
     assert scoring.MODEL_PATH.exists()
+    # Layer-1 Ridge probe must be trained and persisted alongside the XGBoost head.
+    assert visual_preference.PROBE_PATH.exists()
 
     rng = np.random.default_rng(99)
     pred, source = scoring.predict_score(conn, np.frombuffer(_embedding(rng), dtype=np.float32),
-                                         FLAGS_A, ["w"], 3.0)
+                                         FLAGS_A, ["w"], 3.0, {"price": 13000, "area": 8.0})
     assert source == "xgboost"
     assert isinstance(pred, float)
     assert 1.0 <= pred <= 5.0
@@ -127,7 +174,11 @@ def test_model_save_load_roundtrip_matches(tmp_path):
     scoring.train_and_save(conn)
     model = scoring._load_trained_model(conn)
     rng = np.random.default_rng(11)
-    feats = np.stack([scoring._features(_embedding(rng), FLAGS_A, ["w"]) for _ in range(8)])
+    feats = np.stack([
+        scoring.fusion_vector(float(rng.random()), float(rng.uniform(1, 5)), FLAGS_A, ["w"],
+                              {"price": int(rng.uniform(10000, 17000)), "area": 8.0})
+        for _ in range(8)
+    ])
     reloaded = scoring._load_trained_model(conn)
     np.testing.assert_allclose(model.predict(feats), reloaded.predict(feats), rtol=1e-6)
 
@@ -155,6 +206,11 @@ def test_score_all_unrated_cold_backfills_qwen(tmp_path):
     assert rows["U2"] == (pytest.approx(2.4), "qwen")
     # Rated rows are excluded from backfill (predicted_score stays NULL).
     assert rows["R0"] == (None, None)
+    # Cold start still produces Layer-1/2 scalars (centroid cosine + normalized qwen).
+    prefs = {r["listing_id"]: (r["dino_visual_score"], r["qwen_score"]) for r in conn.execute(
+        "SELECT listing_id, dino_visual_score, qwen_score FROM listings")}
+    assert prefs["U1"][1] == pytest.approx((4.2 - 1) / 4)
+    assert 0.0 <= prefs["U1"][0] <= 1.0
     conn.close()
 
 
@@ -162,8 +218,8 @@ def test_score_all_unrated_warm_backfills_xgboost(tmp_path):
     conn = database.connect(tmp_path / "backfill-warm.db")
     _seed_labeled_set(conn, 22)
     rng = np.random.default_rng(5)
-    _seed_listing(conn, "U1", emb=_embedding(rng), flags=FLAGS_A, warnings=["w"], qwen=3.3)
-    _seed_listing(conn, "U2", emb=_embedding(rng, scale=0.5), flags=FLAGS_B, qwen=3.3)
+    _seed_listing(conn, "U1", emb=_structured(rng, BASE_LIKE), flags=FLAGS_A, warnings=["w"], qwen=4.4)
+    _seed_listing(conn, "U2", emb=_structured(rng, BASE_DISLIKE), flags=FLAGS_B, qwen=1.6)
     written = scoring.score_all_unrated(conn)
     assert written == 2
     rows = {r["listing_id"]: (r["predicted_score"], r["score_source"]) for r in

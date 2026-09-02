@@ -132,7 +132,9 @@ gh workflow run scrape_relay.yml
 - DrissionPage is non-commercial licensed. See `docs/` for full analysis.
 - **DINOv3 dedup:** feature extraction uses Meta DINOv3 ViT-B/16 (`dinov3-vit-base`). Weights are cached under
   `models/dinov3_cache/` (offline after initial pull; set `HF_HUB_OFFLINE=1` to force). The extractor emits
-  768-dim float32 L2-normalized CLS embeddings, keeping the XGBoost concat and SQLite BLOB schema unchanged.
+  768-dim float32 L2-normalized CLS embeddings, keeping the SQLite BLOB schema unchanged. The raw
+  vector feeds Layer 1 (`src/visual_preference.py`), which compresses it to the scalar
+  `dino_visual_score` (liked-centroid cosine ≤20 ratings, Ridge linear probe >20) for the XGBoost fusion.
 - Verified: full pipeline passes end-to-end in fixtures mode on GPU (DINOv3 + Qwen
   vision + cold-start/XGBoost scoring); ntfy payload validated via local capture
-  (Title header is ASCII `(x.x/5)` — a `★` in the header breaks latin-1 encoding).
+  (Title header is ASCII `(x.xx/5)` — a `★` in the header breaks latin-1 encoding).

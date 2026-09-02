@@ -33,7 +33,11 @@ Dedup tests need real image content: DINOv3 CLS collapses on textureless synthet
 - `requirements.txt` is **relay-runner-only** (requests + Pillow). Heavy deps (torch, transformers, xgboost, DrissionPage) are in `pyproject.toml` and must NOT be added to requirements.txt.
 - DB schema migrations go in `src/database.py` `_EXTRA_COLUMNS` (idempotent `ALTER TABLE`); DB is `data/apartments.db` (WAL).
 - All pipeline stages fail-soft by design — broad `except Exception` is intentional (ruff `BLE001` ignored, line-length 110). Don't "fix" it.
-- ntfy headers must be ASCII/latin-1: score rendered as `(x.x/5)`, never `★` (breaks latin-1 encoding).
+- ntfy headers must be ASCII/latin-1: score rendered as `(x.xx/5)` (2 decimals), never `★` (breaks latin-1 encoding).
+- Layer 1 visual preference lives in `src/visual_preference.py`: XGBoost's input is the
+  compressed fusion vector `scoring.FEATURE_NAMES` (dino_visual_score + qwen_score + flags +
+  tabular), never the raw 768-d blob; changing the vector width invalidates `models/xgboost_head.json`
+  and `models/dino_probe.npz` (both auto-retrain).
 - All user-facing text is English: vision prompt demands English warnings; `notifier._summary`/`_en`
   translate the fixed Chinese vocabulary (districts/kind/heuristics/legacy rows). Keep new warning
   strings English or add them to `notifier._WARN_EN`; the consolidate-preferences prompt also forces English bullets.

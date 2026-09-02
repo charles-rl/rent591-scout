@@ -122,12 +122,12 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
     price = listing.get("price") or "—"
     message = (
         f"{_summary(listing)}\n"
-        f"NT${price}/mo | Rating {predicted_score:.1f}/5\n"
+        f"NT${price}/mo | Rating {predicted_score:.2f}/5\n"
         f"⚠️ {warnings_str}\n"
         f"{url}"
     )
     headers = {
-        "Title": _header_safe(f"Apartment Match ({predicted_score:.1f}/5)"),
+        "Title": _header_safe(f"Apartment Match ({predicted_score:.2f}/5)"),
         "Click": _header_safe(url),
         "Tags": "house,bathroom",
     }

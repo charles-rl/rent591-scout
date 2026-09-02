@@ -33,6 +33,7 @@ from src import (
     notifier,
     scoring,
     vision_llm,
+    visual_preference,
 )
 from src.utils import health_check, image_queue, proxy_check
 
@@ -177,13 +178,16 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
     listing["qwen_vision_flags"] = analysis["vision_flags"]
     listing["qwen_direct_score"] = analysis["qwen_direct_score"]
 
-    # Scoring. XGBoost was trained on the aggregate embedding — infer on the same feature.
+    # Scoring. Layer 1 compresses the aggregate embedding to dino_visual_score;
+    # Layer 3 fuses [dino_visual_score, qwen_score, flags, tabular] for XGBoost.
     agg = deduplication.aggregate_embedding(list(new_vecs.values()))
     listing["dino_embedding"] = agg
     dino_vec = np.frombuffer(agg, dtype=np.float32) if agg else np.zeros(768, dtype=np.float32)
+    listing["dino_visual_score"] = visual_preference.compute_visual_score(conn, dino_vec)
+    listing["qwen_score"] = scoring.normalize_qwen(analysis["qwen_direct_score"])
     predicted, source = scoring.predict_score(
         conn, dino_vec, analysis["vision_flags"], listing["qwen_warnings"],
-        analysis["qwen_direct_score"],
+        analysis["qwen_direct_score"], listing,
     )
     listing["predicted_score"] = predicted
     listing["score_source"] = source

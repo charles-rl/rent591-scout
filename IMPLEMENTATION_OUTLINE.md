@@ -52,12 +52,17 @@ This system integrates two open-source scraping components:
                      └─────────────────┬─────────────────┘
                                        │
                                        ▼
-                     ┌───────────────────────────────────┐
-                     │ 4. Scoring Engine                 │
-                     │    - First 20 Samples: Qwen Score │
-                     │    - Post-20: XGBoost Model      │
-                     │      (DINO Embedding + Qwen Flags)│
-                     └─────────────────┬─────────────────┘
+                      ┌────────────────────────────────────┐
+                      │ 4. Scoring Engine (3-Layer Fusion) │
+                      │    - L1: DINO 768-d -> scalar      │
+                      │      dino_visual_score             │
+                      │      (liked centroid <=20 rated,   │
+                      │       Ridge linear probe >20)      │
+                      │    - L2: qwen_score (0.0-1.0)      │
+                      │    - First 20 Samples: Qwen Score  │
+                      │    - Post-20: XGBoost on fusion    │
+                      │      (scalars + flags + tabular)   │
+                      └─────────────────┬─────────────────┘
                                        │
                      ┌─────────────────┴─────────────────┐
                      │                                   │
@@ -125,10 +130,12 @@ CREATE TABLE IF NOT EXISTS listings (
     -- Qwen Extracted Features
     qwen_warnings JSON,                     -- e.g., ["4th floor walk-up", "Elec $6/kWh"]
     qwen_vision_flags JSON,                 -- e.g., {"has_bathroom_img": true, "shower_sink_combo": false, ...}
-    qwen_direct_score REAL,                 -- 1.0 to 5.0 cold-start score
+    qwen_direct_score REAL,                 -- 1.0 to 5.0 native Qwen score (cold-start score)
+    qwen_score REAL,                        -- Layer 2 normalized: (qwen_direct_score - 1) / 4, 0.0-1.0
+    dino_visual_score REAL,                 -- Layer 1 scalar 0.0-1.0 (centroid cosine / Ridge probe)
 
     -- Feature Vectors
-    dino_embedding BLOB,                    -- mean-aggregated float32 (768-dim)
+    dino_embedding BLOB,                    -- mean-aggregated float32 (768-dim); raw input to Layer 1
     predicted_score REAL,
     score_source TEXT,                      -- 'qwen' | 'xgboost'
 
@@ -227,8 +234,9 @@ Before executing expensive visual LLM passes, verify listing availability and pe
 The extractor is upgraded from `facebook/dinov2-base` (DINOv2) to **Meta DINOv3 ViT-B/16**
 (`dinov3-vit-base`, self-supervised LVD-1689M pretraining). Loading via Hugging Face
 `transformers` (`AutoModel` / `AutoImageProcessor`) keeps the downstream contract intact:
-the CLS token is still a **768-dimensional float32** vector, so XGBoost feature
-concatenation and the SQLite BLOB schema are unchanged.
+the CLS token is still a **768-dimensional float32** vector, so the SQLite BLOB schema is
+unchanged. The raw vector no longer feeds XGBoost directly — Layer 1
+(`src/visual_preference.py`) compresses it to the scalar `dino_visual_score` (0.0–1.0).
 
 ```python
 import os
@@ -276,7 +284,8 @@ def embed_dinov3(image_path):
   layout cues across bathroom/layout photos, which sharpens the per-image cosine signal that the
   group-average dedup formula consumes.
 - **Same vector contract** — ViT-B/16 still emits a 768-dim CLS embedding; only feature quality
-  improves, so no schema or XGBoost-head changes are required.
+  improves, so no BLOB-schema changes are required (the XGBoost head consumes the Layer-1
+  compressed `dino_visual_score`, not the raw embedding).
 
 #### Group Cosine Similarity Formula
 
@@ -332,9 +341,12 @@ Return ONLY a valid JSON object matching this schema:
     "has_kitchen_sink": bool,       // True if dedicated kitchen/countertop sink exists
     "has_exterior_window": bool     // True if bathroom has direct exterior window
   },
-  "predicted_score": float          // 1.0 to 5.0 score based on user context rules
+  "qwen_direct_score": float        // 1.0 to 5.0 score based on user context rules
 }
 """
+// NOTE: the emitted field is qwen_direct_score (the legacy "predicted_score" key is still
+// accepted by the parser for old payloads). "predicted_score" is reserved for the Layer-3
+// XGBoost output; downstream, qwen_direct_score is normalized to qwen_score = (score-1)/4.
 
 def construct_full_prompt(sqlite_conn):
     cursor = sqlite_conn.cursor()
@@ -349,55 +361,49 @@ def construct_full_prompt(sqlite_conn):
 
 ---
 
-### Component 4: Scoring Engine (Cold-Start & XGBoost)
+### Component 4: Scoring Engine — 3-Layer Preference Fusion
 
-* **Cold-Start Phase ($\le 20$ Labeled Samples):** Set `predicted_score = qwen_direct_score`.
-* **Supervised Phase ($> 20$ Labeled Samples):** Train an XGBoost classifier/regressor using the 768-dimensional DINOv3 multi-photo feature vector concatenated with binary Qwen metadata flags.
-* **Unsupervised Feature Learning:** Store all unrated listing embeddings in SQLite for dimensionality reduction (PCA/UMAP) and cluster feature analysis.
+**Layer 1 — Visual Preference Engine** (`src/visual_preference.py`): compresses the
+768-dim DINOv3 embedding into a single normalized scalar `dino_visual_score` (0.0–1.0).
 
-```python
-import xgboost as xgb
-import numpy as np
+* **Phase 1 — Cold Start ($\le 20$ labeled listings):** cosine similarity between the
+  listing embedding and the mean embedding ($\vec{V}_{\text{liked}}$) of liked listings
+  (`user_score >= 4.0`), clipped to [0,1]. Avoids parameter overfitting while data is scarce.
+* **Phase 2 — Matured Model ($> 20$ labeled listings):** automatic transition to a
+  **closed-form Ridge linear probe** on the raw 768-dim vectors (regression target
+  $(\text{user\_score}-1)/4$, output clipped to [0,1]), learning per-dimension weights that
+  penalize dark/dated spaces and reward preferred aesthetics. Weights persist to
+  `models/dino_probe.npz` (env `DINO_PROBE_PATH`).
 
-def train_or_predict_score(db_cursor, new_item_features):
-    # Check total user-rated samples
-    db_cursor.execute("SELECT COUNT(*) FROM listings WHERE user_rated = TRUE")
-    rated_count = db_cursor.fetchone()[0]
-    
-    if rated_count <= 20:
-        # Cold Start: Return Qwen direct rating
-        return new_item_features["qwen_direct_score"]
-    
-    # Extract training dataset
-    db_cursor.execute("""
-        SELECT dino_embedding, qwen_vision_flags, user_score 
-        FROM listings WHERE user_rated = TRUE
-    """)
-    rows = db_cursor.fetchall()
-    
-    X_train, y_train = [], []
-    for emb_blob, flags_json, target in rows:
-        emb_vec = np.frombuffer(emb_blob, dtype=np.float32)
-        flags = json.loads(flags_json)
-        feature_vector = np.concatenate([emb_vec, list(flags.values())])
-        X_train.append(feature_vector)
-        y_train.append(target)
-        
-    # Fit light XGBoost Regressor
-    model = xgb.XGBRegressor(max_depth=3, n_estimators=50, learning_rate=0.1)
-    model.fit(np.array(X_train), np.array(y_train))
-    
-    # Predict for new item
-    new_vec = np.concatenate([new_item_features["dino_vec"], list(new_item_features["flags"].values())])
-    return float(model.predict(np.array([new_vec]))[0])
+**Layer 2 — Textual Preference Memory** (see Component 3): Qwen's `qwen_direct_score`
+(1–5) is normalized to `qwen_score = (qwen_direct_score - 1) / 4` (0.0–1.0).
 
+**Layer 3 — Feature Fusion & XGBoost Regressor** (`src/scoring.py`):
+
+* **Cold-Start Phase ($\le 20$ rated):** `predicted_score = qwen_direct_score`
+  (`score_source='qwen'`); Layer 1 still computes and stores `dino_visual_score` via centroid.
+* **Supervised Phase ($> 20$ rated):** `XGBRegressor(max_depth=3, n_estimators=50, lr=0.1)`
+  trained on `user_score` over the compressed fusion vector, persisted to
+  `models/xgboost_head.json`, prediction clamped to [1.0, 5.0]:
+
+```text
+X = [dino_visual_score, qwen_score,
+     has_bathroom_img, shower_sink_combo, drainage_risk, has_kitchen_sink,
+     has_exterior_window, has_warnings,
+     log1p(price), area_ping, price_per_ping, floor_num,
+     HIGH_ELEC_FEE, MANUAL_TRASH]              # scoring.FEATURE_NAMES (14 dims)
 ```
+
+The raw 768-dim embedding is never concatenated into the XGBoost vector; every stage
+fails soft (probe/model load failures fall back to the liked centroid / Qwen score).
+* **Unsupervised Feature Learning:** Store all unrated listing embeddings in SQLite for dimensionality reduction (PCA/UMAP) and cluster feature analysis.
 
 ---
 
 ### Component 5: Push Notification Payload (`ntfy.sh`)
 
-When `predicted_score >= 3.5`, trigger an HTTP `POST` to `ntfy.sh`.
+When `predicted_score >= 3.5`, trigger an HTTP `POST` to `ntfy.sh`. Scores render with
+3 significant figures (`{score:.2f}` on the 1–5 scale) in both the body and the Title.
 
 ```python
 import requests
@@ -408,7 +414,7 @@ def send_ntfy_alert(topic_name, listing):
     message = f"NT${listing['price']} - {listing['title']}\n⚠️ {warnings_str}"
     
     headers = {
-        "Title": f"Apartment Match ({listing['predicted_score']:.1f}/5)",
+        "Title": f"Apartment Match ({listing['predicted_score']:.2f}/5)",
         "Click": listing["url"],
         "Tags": "house,bathroom"
     }
@@ -488,6 +494,7 @@ When creating the repository, follow this folder layout:
 │   └── apartments.db            # SQLite primary database
 ├── models/
 │   ├── xgboost_head.json        # Saved XGBoost weights
+│   ├── dino_probe.npz           # Layer-1 Ridge probe weights (768-d -> dino_visual_score)
 │   └── dinov3_cache/            # Local DINOv3 model weights (offline)
 │       └── facebook_dinov3-vit-base/  # config.json + model.safetensors (ViT-B/16)
 ├── src/
@@ -497,8 +504,9 @@ When creating the repository, follow this folder layout:
 │   ├── constants591.py         # Vendored region/section/kind ID maps
 │   ├── ingestion.py             # Ingestion combining mcp-591 & 591scraper
 │   ├── deduplication.py         # Multi-image DINO group cosine similarity
+│   ├── visual_preference.py     # Layer 1: liked centroid / Ridge probe -> dino_visual_score
 │   ├── vision_llm.py            # Qwen 27B (Ollama) wrapper & JSON parser
-│   ├── scoring.py               # Cold-start router & XGBoost inference
+│   ├── scoring.py               # Layer 3: fusion vector builder, router & XGBoost head
 │   ├── notifier.py              # ntfy.sh HTTP webhook publisher
 │   └── dynamic_prompt.py        # Preference summarizer & prompt manager
 ├── rate.py                      # CLI feedback script
@@ -516,6 +524,6 @@ When creating the repository, follow this folder layout:
 2. **Filter Dead Links:** Validate `HTTP 200` status and verify non-expired listing text.
 3. **Deduplicate:** Generate DINOv3 (ViT-B/16) CLS vectors for listing photos from `models/dinov3_cache` (offline after initial pull); evaluate group cosine similarity against SQLite database ($>0.95$ threshold drops listing).
 4. **LLM Inference:** Pass photos and Chinese text to local Qwen 27B Vision API with Base + Dynamic system prompt.
-5. **Predict:** Compute score using Qwen direct rating (if $\le 20$ ratings exist) or XGBoost regressor (if $> 20$ ratings exist).
-6. **Notify:** If predicted score $\ge 3.5$, trigger `ntfy.sh` push notification with listing URL and warning highlights.
-7. **Store:** Persist features, warnings, and scores into SQLite `listings` table.
+5. **Predict:** Layer 1 computes `dino_visual_score` (centroid cosine if $\le 20$ ratings exist, Ridge probe if $> 20$); Layer 3 predicts with Qwen direct rating (if $\le 20$ ratings exist) or the XGBoost regressor on the fusion vector (if $> 20$ ratings exist).
+6. **Notify:** If predicted score $\ge 3.5$, trigger `ntfy.sh` push notification with listing URL and warning highlights (score shown to 2 decimals, 3 significant figures).
+7. **Store:** Persist features (`dino_visual_score`, `qwen_score`), warnings, and scores into SQLite `listings` table.

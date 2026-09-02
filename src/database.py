@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS listings (
     description TEXT,
     image_urls JSON, image_paths JSON,
     qwen_warnings JSON, qwen_vision_flags JSON, qwen_direct_score REAL,
+    qwen_score REAL,
+    dino_visual_score REAL,
     dino_embedding BLOB,
     predicted_score REAL, score_source TEXT,
     heuristic_score REAL,
@@ -88,6 +90,8 @@ _EXTRA_COLUMNS = [
     ("image_status", "TEXT DEFAULT 'pending'"),
     ("text_only_notified", "BOOLEAN DEFAULT FALSE"),
     ("heuristic_score", "REAL"),
+    ("qwen_score", "REAL"),
+    ("dino_visual_score", "REAL"),
 ]
 
 
@@ -161,7 +165,8 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "tags", "contain_cost", "raw_search", "raw_metadata", "scraper_raw",
         "social_house", "facilities",
         "description", "image_urls", "image_paths",
-        "qwen_warnings", "qwen_vision_flags", "qwen_direct_score",
+        "qwen_warnings", "qwen_vision_flags", "qwen_direct_score", "qwen_score",
+        "dino_visual_score",
         "dino_embedding", "predicted_score", "score_source", "heuristic_score",
         "image_status",
     ]
@@ -227,15 +232,32 @@ def get_rating_count(conn: sqlite3.Connection) -> int:
 
 def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT dino_embedding, qwen_vision_flags, qwen_warnings, user_score FROM listings WHERE user_rated = 1"
+        "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, user_score, qwen_direct_score, "
+        "price, area, floor, shape, tags, description FROM listings WHERE user_rated = 1"
     ).fetchall()
 
 
 def get_scoring_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score "
+        "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score, "
+        "price, area, floor, shape, tags, description "
         "FROM listings WHERE IFNULL(user_rated, 0) != 1"
     ).fetchall()
+
+
+def get_liked_embeddings(conn: sqlite3.Connection, min_score: float = 4.0) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT dino_embedding FROM listings WHERE user_rated = 1 AND user_score >= ?", (min_score,)
+    ).fetchall()
+
+
+def set_preference_scores(conn: sqlite3.Connection, updates: list[tuple[str, float, float]]) -> int:
+    conn.executemany(
+        "UPDATE listings SET dino_visual_score=?, qwen_score=?, updated_at=CURRENT_TIMESTAMP WHERE listing_id=?",
+        [(dino, qwen, listing_id) for listing_id, dino, qwen in updates],
+    )
+    conn.commit()
+    return len(updates)
 
 
 def set_predicted_scores(conn: sqlite3.Connection, updates: list[tuple[str, float, str]]) -> int:
