@@ -33,6 +33,7 @@ from src import (
     scoring,
     vision_llm,
 )
+from src.utils import health_check
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("main")
@@ -70,6 +71,13 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool,
         logger.info("%s delisted/inactive -> skip", listing["listing_id"])
         listing["is_active"] = False
         database.upsert_listing(conn, listing)
+        return "inactive"
+
+    # Health check: live DOM probe (591 reachable) or offline payload inspection.
+    probe = listing["url"] if incoming_dir is None else {"status": listing.get("status")}
+    if not health_check.is_listing_active(probe):
+        logger.info("%s health check: dead/expired listing -> is_active=0", listing["listing_id"])
+        health_check.mark_listing_inactive(conn, listing["listing_id"])
         return "inactive"
 
     if incoming_dir is None:

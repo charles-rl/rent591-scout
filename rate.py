@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src import database, dynamic_prompt  # noqa: E402
+from src import database, dynamic_prompt, scoring
 
 
 def main() -> None:
@@ -31,8 +31,20 @@ def main() -> None:
     print(f"Rating saved for listing {args.id}.")
 
     if args.comment:
-        bullets = dynamic_prompt.update_preferences(conn, args.comment)
-        print(f"Dynamic Preference Prompt updated:\n{bullets}")
+        try:
+            bullets = dynamic_prompt.update_preferences(conn, args.comment)
+            print(f"Dynamic Preference Prompt updated:\n{bullets}")
+        except Exception as e:
+            print(f"Preference consolidation skipped: {e}")
+
+    rated = database.get_rating_count(conn)
+    if rated > scoring.RATED_THRESHOLD:
+        print(f"{rated} rated listings (> {scoring.RATED_THRESHOLD}) -> retraining XGBoost head...")
+        try:
+            scoring.train_and_save(conn)
+            print("XGBoost model head retrained.")
+        except Exception as e:
+            print(f"Retrain skipped: {e}")
     conn.close()
 
 
