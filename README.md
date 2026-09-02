@@ -120,6 +120,11 @@ gh workflow run scrape_relay.yml
   end-to-end testing against captured responses in `external/mcp-591/tests/fixtures`.
 - Live runs honor `HTTPS_PROXY`/`HTTP_PROXY` automatically (requests `trust_env=True`).
   On a restricted host, export a forward proxy that can reach 591 before running.
+- **English user output:** the Qwen prompt mandates English `qwen_warnings`, rule/heuristic
+  warnings are English, and `src/notifier.py` renders the alert body from structured fields
+  (district/kind/layout/floor/shape maps) plus a fixed-string translation table for legacy
+  Chinese DB rows — 591 titles/addresses stay Chinese in the DB, out of the alert body.
+  Only short glosses like "(頂樓加蓋)" may leak through; acceptable.
 - All ntfy pushes are tunnel-first with direct fallback (`src/notifier.py`): the GPU
   server cannot reach `ntfy.sh` directly, but the PC devtunnel path returns 200 while
   the PC is online. The offline "connect the proxy" alert can only be delivered when

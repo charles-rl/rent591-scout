@@ -135,9 +135,9 @@ def test_extract_text_warnings_rules():
     w = main.extract_text_warnings({
         "floor": "5樓/12樓(頂樓)", "description": "整租，水電另計", "deposit": "半年",
     })
-    assert any("頂樓" in x for x in w)
-    assert any("水電" in x for x in w)
-    assert "要求半年付" in w
+    assert any("Top floor" in x for x in w)
+    assert any("Utilities" in x for x in w)
+    assert "6-month upfront payment required" in w
     assert main.extract_text_warnings({"floor": "3樓", "description": "", "deposit": "押一"}) == []
 
 
@@ -150,7 +150,7 @@ def test_offline_stores_pending_and_alerts_once(env):
     assert row["image_status"] == "pending"
     assert bool(row["text_only_notified"]) is True
     warnings = json.loads(row["qwen_warnings"])
-    assert any("頂樓" in x for x in warnings) and any("水電" in x for x in warnings)
+    assert any("Top floor" in x for x in warnings) and any("Utilities" in x for x in warnings)
     assert env["calls"]["proxy_alert"] == [(1, PROXY)]  # tunnel-first delivery
     assert env["calls"]["ntfy"] == []
 

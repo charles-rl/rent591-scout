@@ -41,6 +41,70 @@ def _post(message: str, headers: dict, proxy: str | None = None) -> bool:
     return False
 
 
+_SECTION_EN = {
+    "汐止區": "Xizhi", "三重區": "Sanchong", "南港區": "Nangang", "內湖區": "Neihu",
+    "北投區": "Beitou", "大同區": "Datong", "士林區": "Shilin", "蘆洲區": "Luzhou",
+    "淡水區": "Tamsui", "板橋區": "Banqiao",
+    "台北市": "Taipei", "新北市": "New Taipei",
+}
+_KIND_EN = {
+    "套房": "private suite", "整層住家": "whole flat", "分租套房": "suite in shared house",
+    "雅房": "partition room", "店面": "storefront", "事務所": "office",
+}
+_SHAPE_EN = {
+    "電梯大樓": "elevator building", "公寓": "walk-up", "透天厝": "townhouse",
+    "大廈": "multistory building", "別墅": "villa",
+}
+_WARN_EN = [
+    ("衛浴獨立性未確認", "Bathroom privacy unconfirmed"),
+    ("頂樓加蓋疑慮", "Suspected illegal rooftop addition"),
+    ("無窗/採光不足", "No window / poor light"),
+    ("採光不足", "Poor light"),
+    ("共用卫浴", "Shared bathroom"),
+    ("共用衛浴", "Shared bathroom"),
+    ("無窗", "No window"),
+    ("頂樓：可能炎熱/漏水", "Top floor: heat/leak risk"),
+    ("一樓：注意採光與隱私", "1st floor: light & privacy concerns"),
+    ("水電/管理費另計", "Utilities/management fees extra"),
+    ("要求半年付", "6-month upfront payment required"),
+    ("要求季付", "Quarterly upfront payment required"),
+    ("付款規則", "Unusual payment rule"),
+    ("電費超過 5 元/度", "Electricity billed above 5 NTD/kWh"),
+    ("禁止養寵", "No pets allowed"),
+    ("5樓以上無電梯", "5F+ walk-up, no elevator"),
+    ("需追垃圾車", "Manual trash disposal (garbage-truck chasing)"),
+    ("共享/投幣洗衣", "Shared / coin-operated laundry"),
+]
+
+
+def _en(text: str) -> str:
+    """Best-effort translation of the pipeline's fixed Chinese warning vocabulary."""
+    text = str(text or "").replace("：", ": ")
+    for zh, en in _WARN_EN:
+        if zh in text:
+            return text.replace(zh, en)
+    return text
+
+
+def _en_line(*parts) -> str:
+    return " · ".join(str(p) for p in parts if p)
+
+
+def _summary(listing: dict) -> str:
+    """Structured English one-liner (591 titles/addresses are Chinese and untranslatable here)."""
+    layout = str(listing.get("layout") or "").replace("房", "BR ").replace("廳", "LR ").replace("衛浴", "BA").replace("衛", "BA")
+    floor = str(listing.get("floor") or "").replace("頂樓", "top floor").replace("頂層", "top floor").replace("樓", "F")
+    section = _SECTION_EN.get(listing.get("section") or "", listing.get("section") or "")
+    region = _SECTION_EN.get(listing.get("region") or "", "")
+    where = _en_line(section, region)
+    area = listing.get("area")
+    return _en_line(
+        _KIND_EN.get(listing.get("kind_name") or "", listing.get("kind_name")),
+        layout.strip(), floor, _SHAPE_EN.get(listing.get("shape") or "", listing.get("shape")),
+        f"{float(area):g} ping" if area else None, where,
+    )
+
+
 def send_ntfy_alert(listing: dict, predicted_score: float | None = None, threshold: float = 3.5,
                     proxy: str | None = None) -> bool:
     """Push an ntfy.sh alert for a high-scoring match. Non-fatal: returns False on failure.
@@ -52,12 +116,13 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
         predicted_score = float(listing.get("predicted_score") or 0.0)
     if predicted_score < threshold:
         return False
-    warnings = listing.get("qwen_warnings") or []
-    warnings_str = " | ".join(str(w) for w in warnings) if warnings else "No major issues"
+    warnings = [_en(w) for w in (listing.get("qwen_warnings") or [])]
+    warnings_str = " | ".join(warnings) if warnings else "No major issues"
     url = str(listing.get("url") or "")
+    price = listing.get("price") or "—"
     message = (
-        f"{listing.get('title') or 'Untitled listing'}\n"
-        f"NT${listing.get('price') or '—'} | Rating {predicted_score:.1f}/5\n"
+        f"{_summary(listing)}\n"
+        f"NT${price}/mo | Rating {predicted_score:.1f}/5\n"
         f"⚠️ {warnings_str}\n"
         f"{url}"
     )

@@ -160,12 +160,12 @@ PENALTY_POINTS: dict[str, int] = {
     "SHARED_WASHER": -5,
 }
 PENALTY_MESSAGES: dict[str, str] = {
-    "HIGH_ELEC_FEE": "電費超過 5 元/度",
-    "NO_PETS": "禁止養寵",
-    "HIGH_WALKUP": "5樓以上無電梯",
-    "ILLEGAL_ROOFTOP": "頂樓加蓋疑慮",
-    "MANUAL_TRASH": "需追垃圾車",
-    "SHARED_WASHER": "共享/投幣洗衣",
+    "HIGH_ELEC_FEE": "Electricity billed above 5 NTD/kWh",
+    "NO_PETS": "No pets allowed",
+    "HIGH_WALKUP": "5F+ walk-up, no elevator",
+    "ILLEGAL_ROOFTOP": "Suspected illegal rooftop addition",
+    "MANUAL_TRASH": "Manual trash disposal (garbage-truck chasing)",
+    "SHARED_WASHER": "Shared / coin-operated laundry",
 }
 _PET_PATTERNS = ("不可寵", "禁寵", "嚴禁寵物")
 _ROOFTOP_PATTERNS = ("頂樓加蓋", "頂加", "鐵皮加蓋")

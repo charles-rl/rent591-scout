@@ -34,6 +34,9 @@ Dedup tests need real image content: DINOv3 CLS collapses on textureless synthet
 - DB schema migrations go in `src/database.py` `_EXTRA_COLUMNS` (idempotent `ALTER TABLE`); DB is `data/apartments.db` (WAL).
 - All pipeline stages fail-soft by design — broad `except Exception` is intentional (ruff `BLE001` ignored, line-length 110). Don't "fix" it.
 - ntfy headers must be ASCII/latin-1: score rendered as `(x.x/5)`, never `★` (breaks latin-1 encoding).
+- All user-facing text is English: vision prompt demands English warnings; `notifier._summary`/`_en`
+  translate the fixed Chinese vocabulary (districts/kind/heuristics/legacy rows). Keep new warning
+  strings English or add them to `notifier._WARN_EN`; the consolidate-preferences prompt also forces English bullets.
 - Proxy traffic uses `verify=False` because devtunnel MITMs TLS with a cert Python rejects.
 - 591 CDN 403s on original photo URLs via the tunnel → fetch `!fit.1000x.water2.jpg` resize variants (`PROXY_IMAGE_SUFFIX`). CDN 502 storms = throttling (backoff, stay `pending`), not a dead proxy.
 - Tests must stay offline: `HF_HUB_OFFLINE=1`, cached DINOv3 weights, fixture replay, mocked Ollama/ntfy/proxy. `conftest.py` inserts repo root into `sys.path`.

@@ -71,19 +71,19 @@ def extract_text_warnings(listing: dict) -> list[str]:
     warnings: list[str] = []
     floor = str(listing.get("floor") or "")
     if any(m in floor for m in ("頂樓", "顶楼", "頂層")):
-        warnings.append("頂樓：可能炎熱/漏水")
+        warnings.append("Top floor: heat/leak risk")
     elif any(m in floor for m in ("一樓", "1樓")):
-        warnings.append("一樓：注意採光與隱私")
+        warnings.append("1st floor: light & privacy concerns")
     blob = str(listing.get("description") or "")
     if any(m in blob for m in ("水電另計", "電費另計", "水費另計", "代管理費", "管理費另")):
-        warnings.append("水電/管理費另計")
+        warnings.append("Utilities/management fees extra")
     deposit = str(listing.get("deposit") or "")
     if "半年" in deposit:
-        warnings.append("要求半年付")
+        warnings.append("6-month upfront payment required")
     elif "季" in deposit:
-        warnings.append("要求季付")
+        warnings.append("Quarterly upfront payment required")
     elif "年" in deposit and "一年" not in deposit:
-        warnings.append(f"付款規則：{deposit}")
+        warnings.append(f"Unusual payment rule: {deposit}")
     return warnings
 
 

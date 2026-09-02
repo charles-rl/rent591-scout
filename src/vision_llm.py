@@ -33,7 +33,7 @@ You must extract facts from Chinese listing text and analyze all provided images
 
 Return ONLY a valid JSON object matching this schema (no prose, no code fences):
 {
-  "qwen_warnings": ["string warning highlights, e.g. 4th floor walk-up, shared meter"],
+  "qwen_warnings": ["warning highlights written in ENGLISH, e.g. 4th floor walk-up, shared meter"],
   "vision_flags": {
     "has_bathroom_img": bool,
     "shower_sink_combo": bool,
@@ -46,15 +46,19 @@ Return ONLY a valid JSON object matching this schema (no prose, no code fences):
 qwen_direct_score is 1.0 to 5.0 based on the user context rules and overall condition.
 If no images are available, set all vision_flags to false and base the score on text only.
 
+All qwen_warnings strings must be written in English (the reviewer does not read Chinese),
+even though the listing text you read is Chinese.
+
 Verification rules (soft constraints — warn, never silently reject):
 - 分租套房/共居 listing: determine whether the bathroom is 獨立衛浴 (private, inside the
   rented unit) or 共用 (shared hallway/floor). If text and photos cannot confirm it, do NOT
-  guess — add warning "衛浴獨立性未確認" and let the human reviewer decide.
+  guess — add warning "Bathroom privacy unconfirmed" and let the human reviewer decide.
 - Windowless spaces: if the room (or bathroom) has no exterior window/balcony access,
-  set has_exterior_window=false and add a 無窗/採光不足 warning.
+  set has_exterior_window=false and add a "No window / poor light" warning.
 - 頂樓加蓋 (illegal rooftop addition): metal sheet roofing, exterior staircases, or
-  cramped top-floor construction → add warning "頂樓加蓋疑慮".
-- Cooking: note any 可開伙 / 電可開伙 / 禁用明火 mentions in warnings.
+  cramped top-floor construction → add warning "Suspected illegal rooftop addition".
+- Cooking: note any 可開伙 / 電可開伙 / 禁用明火 mentions in warnings, phrased in English
+  (e.g. "Cooking allowed", "Electric cooking only", "Open flame prohibited").
 - Uncertainty policy: when evidence is missing or ambiguous, surface a specific warning
   instead of changing the score; only certain defects should lower qwen_direct_score.
 """
@@ -62,8 +66,9 @@ Verification rules (soft constraints — warn, never silently reject):
 DEFAULT_BULLETS = (
     "- Prioritize dry/wet separation in bathroom.\n"
     "- Flag shower-sink combo faucet setups.\n"
-    "- 分租套房必須確認獨立衛浴；不確定時標示『衛浴獨立性未確認』交由人工判斷。\n"
-    "- 無窗、頂樓加蓋、共用卫浴等疑慮一律標入 qwen_warnings。"
+    "- For suite-in-shared-house listings, confirm a private bathroom; if unsure, "
+    "flag 'Bathroom privacy unconfirmed' for the human reviewer.\n"
+    "- Flag no-window, suspected rooftop-addition and shared-bathroom concerns in qwen_warnings."
 )
 
 _RETRY_NOTE = (
@@ -270,7 +275,8 @@ Return ONLY the bulleted list, one bullet per line starting with "-".
 """
     try:
         messages = [
-            {"role": "system", "content": "You summarize rental preferences concisely."},
+            {"role": "system", "content": "You summarize rental preferences concisely. "
+                            "Always write the bullets in English, even when feedback is in another language."},
             {"role": "user", "content": prompt},
         ]
         raw = ask_ollama(messages, timeout=300)
