@@ -3,6 +3,10 @@
 Phase 1 (<=RATED_THRESHOLD labeled samples): predicted_score = qwen_direct_score.
 Phase 2 (>RATED_THRESHOLD): XGBRegressor over [DINO 768-d embedding; binary flags] -> user_score.
 Feature vector layout: 768 float32 DINOv3 dims + 5 vision flags + 1 has-warnings bit (774).
+
+Also hosts the Stage-3 deterministic penalty engine (docs/591research.md §4):
+baseline 100 minus regex-extracted red flags. Penalties fire only on positive
+textual evidence — ambiguous listings stay penalty-free and go to the user.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import gc
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -138,6 +143,70 @@ def score_all_unrated(conn) -> int:
         database.set_predicted_scores(conn, updates)
     logger.info("scored %d unrated listings", len(updates))
     return len(updates)
+
+
+# --------------------------------------------------------------------------
+# Stage-3 deterministic heuristic penalty engine (docs/591research.md §4)
+# Baseline 100; every penalty requires positive textual evidence so uncertain
+# listings keep 100 and are surfaced to the user via warnings instead.
+# --------------------------------------------------------------------------
+HEURISTIC_BASELINE = 100.0
+PENALTY_POINTS: dict[str, int] = {
+    "HIGH_ELEC_FEE": -15,
+    "NO_PETS": -10,
+    "HIGH_WALKUP": -25,
+    "ILLEGAL_ROOFTOP": -10,
+    "MANUAL_TRASH": -10,
+    "SHARED_WASHER": -5,
+}
+PENALTY_MESSAGES: dict[str, str] = {
+    "HIGH_ELEC_FEE": "電費超過 5 元/度",
+    "NO_PETS": "禁止養寵",
+    "HIGH_WALKUP": "5樓以上無電梯",
+    "ILLEGAL_ROOFTOP": "頂樓加蓋疑慮",
+    "MANUAL_TRASH": "需追垃圾車",
+    "SHARED_WASHER": "共享/投幣洗衣",
+}
+_PET_PATTERNS = ("不可寵", "禁寵", "嚴禁寵物")
+_ROOFTOP_PATTERNS = ("頂樓加蓋", "頂加", "鐵皮加蓋")
+_TRASH_PATTERNS = ("追垃圾車",)
+_WASHER_PATTERNS = ("投幣洗衣", "投幣式洗衣", "共享洗衣")
+_ELEC_RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:元|塊|NTD?|TWD?)\s*/\s*(?:度|kwh)", re.IGNORECASE)
+_ELEC_PER_RE = re.compile(r"(?:每|一)\s*度\s*(?:是|為|=)?\s*(\d+(?:\.\d+)?)")
+_FLOOR_RE = re.compile(r"(\d+)")
+
+
+def heuristic_penalties(listing: dict) -> list[str]:
+    blob = " ".join(filter(None, [
+        str(listing.get("description") or ""),
+        " ".join(str(t) for t in (listing.get("tags") or [])),
+    ]))
+    flags: list[str] = []
+    rates = [float(m.group(1)) for rx in (_ELEC_RATE_RE, _ELEC_PER_RE) for m in rx.finditer(blob)]
+    if any(r > 5.0 for r in rates):
+        flags.append("HIGH_ELEC_FEE")
+    if any(p in blob for p in _PET_PATTERNS):
+        flags.append("NO_PETS")
+    if any(p in blob for p in _ROOFTOP_PATTERNS):
+        flags.append("ILLEGAL_ROOFTOP")
+    if any(p in blob for p in _TRASH_PATTERNS):
+        flags.append("MANUAL_TRASH")
+    if any(p in blob for p in _WASHER_PATTERNS):
+        flags.append("SHARED_WASHER")
+    facilities = [str(f) for f in (listing.get("facilities") or [])]
+    has_elevator = listing.get("shape") == "電梯大樓" or any("電梯" in f for f in facilities)
+    fm = _FLOOR_RE.search(str(listing.get("floor") or ""))
+    if fm and int(fm.group(1)) >= 5 and not has_elevator:
+        flags.append("HIGH_WALKUP")
+    return flags
+
+
+def compute_heuristic_score(listing: dict) -> tuple[float, list[str]]:
+    """Return (score, warning strings) — baseline 100 minus evidenced penalties."""
+    flags = heuristic_penalties(listing)
+    score = HEURISTIC_BASELINE + sum(PENALTY_POINTS[f] for f in flags)
+    warnings = [f"{f}：{PENALTY_MESSAGES[f]}" for f in flags]
+    return score, warnings
 
 
 def train_and_save(conn) -> None:

@@ -45,11 +45,25 @@ Return ONLY a valid JSON object matching this schema (no prose, no code fences):
 }
 qwen_direct_score is 1.0 to 5.0 based on the user context rules and overall condition.
 If no images are available, set all vision_flags to false and base the score on text only.
+
+Verification rules (soft constraints — warn, never silently reject):
+- 分租套房/共居 listing: determine whether the bathroom is 獨立衛浴 (private, inside the
+  rented unit) or 共用 (shared hallway/floor). If text and photos cannot confirm it, do NOT
+  guess — add warning "衛浴獨立性未確認" and let the human reviewer decide.
+- Windowless spaces: if the room (or bathroom) has no exterior window/balcony access,
+  set has_exterior_window=false and add a 無窗/採光不足 warning.
+- 頂樓加蓋 (illegal rooftop addition): metal sheet roofing, exterior staircases, or
+  cramped top-floor construction → add warning "頂樓加蓋疑慮".
+- Cooking: note any 可開伙 / 電可開伙 / 禁用明火 mentions in warnings.
+- Uncertainty policy: when evidence is missing or ambiguous, surface a specific warning
+  instead of changing the score; only certain defects should lower qwen_direct_score.
 """
 
 DEFAULT_BULLETS = (
     "- Prioritize dry/wet separation in bathroom.\n"
-    "- Flag shower-sink combo faucet setups."
+    "- Flag shower-sink combo faucet setups.\n"
+    "- 分租套房必須確認獨立衛浴；不確定時標示『衛浴獨立性未確認』交由人工判斷。\n"
+    "- 無窗、頂樓加蓋、共用卫浴等疑慮一律標入 qwen_warnings。"
 )
 
 _RETRY_NOTE = (

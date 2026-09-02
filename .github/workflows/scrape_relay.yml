@@ -10,9 +10,20 @@ name: scrape-relay
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # Tier 1 — hot zones every 15 min (docs/591research.md §5)
+    - cron: '*/15 * * * *'
+    # Tier 2 — secondary zones hourly (offset +5min so it never collides with a :00/:15 tier-1 run)
+    - cron: '5 * * * *'
+    # Tier 3 — tertiary zones every 3 hours (offset +10min)
+    - cron: '10 */3 * * *'
   workflow_dispatch:
     inputs:
+      tier:
+        description: 'Polling tier to run manually (1/2/3)'
+        required: false
+        default: '1'
+        type: choice
+        options: ['1', '2', '3']
       limit:
         description: 'Max listings per run (-1 = all fetched)'
         required: false
@@ -51,6 +62,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Resolve polling tier (docs/591research.md §5)
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_TIER: ${{ inputs.tier }}
+        run: |
+          case "$SCHEDULE" in
+            '5 * * * *')  TIER=2 ;;
+            '10 */3 * * *') TIER=3 ;;
+            '*/15 * * * *') TIER=1 ;;
+            *) TIER="${INPUT_TIER:-1}" ;;
+          esac
+          case "$TIER" in
+            1) QUERIES="新北市:汐止區,三重區;台北市:南港區" ;;
+            2) QUERIES="台北市:內湖區,北投區,大同區,士林區;新北市:蘆洲區" ;;
+            3) QUERIES="新北市:淡水區,板橋區" ;;
+            *) echo "invalid tier: $TIER" >&2; exit 1 ;;
+          esac
+          echo "POLL_TIER=$TIER" >> "$GITHUB_ENV"
+          echo "X591_QUERIES=$QUERIES" >> "$GITHUB_ENV"
+          echo "tier $TIER -> $QUERIES"
 
       - name: Probe 591 endpoints (prove runner is not blocked)
         run: |

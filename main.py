@@ -109,6 +109,15 @@ def process_listing(conn, entry: dict, baseline: dict, bullets, do_notify: bool)
     detail_failed = entry.get("detail_failed", False)
     listing = ingestion.normalize_listing(item, data, detail_failed=detail_failed)
 
+    keep, reasons = ingestion.passes_hard_filters(listing)
+    if not keep:
+        logger.info("%s hard-filter drop: %s", listing["listing_id"], "; ".join(reasons))
+        return "filtered"
+
+    heur_score, heur_flags = scoring.compute_heuristic_score(listing)
+    listing["heuristic_score"] = heur_score
+    listing["qwen_warnings"] = list(dict.fromkeys(extract_text_warnings(listing) + heur_flags))
+
     if not listing["is_active"]:
         logger.info("%s delisted/inactive -> skip", listing["listing_id"])
         listing["is_active"] = False
@@ -200,6 +209,7 @@ def run(fixtures: bool, limit: int, do_notify: bool) -> int:
     conn = None
     failed = 0
     processed = 0
+    filtered = 0
     try:
         conn = database.connect()
         bullets = dynamic_prompt.get_bullets(conn)
@@ -213,6 +223,7 @@ def run(fixtures: bool, limit: int, do_notify: bool) -> int:
                 outcome = process_listing(conn, entry, baseline, bullets, do_notify)
                 processed += outcome == "stored"
                 failed += outcome == "failed"
+                filtered += outcome == "filtered"
             except Exception:
                 logger.exception("listing %s failed", (entry.get("raw_search") or {}).get("id"))
                 failed += 1
@@ -223,7 +234,8 @@ def run(fixtures: bool, limit: int, do_notify: bool) -> int:
     finally:
         if conn is not None:
             conn.close()
-    logger.info("done: %s new listings processed, %s failed", processed, failed)
+    logger.info("done: %s new listings processed, %s hard-filtered, %s failed",
+                processed, filtered, failed)
     return 1 if failed else 0
 
 
@@ -245,7 +257,7 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
         return 1
     conn = None
     counters = {"ingested": 0, "inactive": 0, "skipped": 0, "stored": 0,
-                "duplicate": 0, "failed": 0, "queued": 0}
+                "duplicate": 0, "failed": 0, "queued": 0, "filtered": 0}
     vision_targets: dict[str, list[dict]] = {}
     try:
         conn = database.connect()
@@ -274,6 +286,12 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                     payload.get("raw_search"), payload.get("raw_metadata"),
                     detail_failed=payload.get("detail_failed", False),
                 )
+                keep, reasons = ingestion.passes_hard_filters(listing)
+                if not keep:
+                    logger.info("%s hard-filter drop: %s", lid, "; ".join(reasons))
+                    database.mark_relay_processed(conn, lid, sha)
+                    counters["filtered"] += 1
+                    continue
                 if not listing["is_active"]:
                     logger.info("%s delisted/inactive -> skip", lid)
                     listing["image_status"] = "skipped"
@@ -284,7 +302,10 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                     health_check.mark_listing_inactive(conn, lid)
                     counters["inactive"] += 1
                 else:
-                    listing["qwen_warnings"] = extract_text_warnings(listing)
+                    heur_score, heur_flags = scoring.compute_heuristic_score(listing)
+                    listing["heuristic_score"] = heur_score
+                    listing["qwen_warnings"] = list(
+                        dict.fromkeys(extract_text_warnings(listing) + heur_flags))
                     urls = payload.get("image_urls") or []
                     listing["image_urls"] = urls
                     rows = []

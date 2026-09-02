@@ -28,7 +28,8 @@ def _write_payload(incoming_dir, lid, image_urls, sha="sha-A"):
         "payload_sha256": sha,
         "image_urls": image_urls,
         "images": [],
-        "raw_search": {"id": int(lid), "title": f"Listing {lid}", "price": "18000",
+        "raw_search": {"id": int(lid), "title": f"Listing {lid}", "price": "15000",
+                       "kind_name": "獨立套房", "area": 8.0,
                        "floor_name": "頂樓", "photoList": list(image_urls)},
         "raw_metadata": {"status": "open", "title": f"Listing {lid}",
                          "remark": {"content": "水電另計"}},
@@ -70,6 +71,63 @@ def _row(env, lid):
         return conn.execute("SELECT * FROM listings WHERE listing_id=?", (lid,)).fetchone()
     finally:
         conn.close()
+
+
+def test_hard_filters_drop_noncompliant_incoming(env):
+    env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: False)
+    base = {"listing_id": None, "detail_failed": False, "payload_sha256": "s",
+            "image_urls": [], "images": [], "raw_metadata": {"status": "open"}}
+    bad = {
+        "2001": {"price": "9000"},                          # under min price
+        "2002": {"price": "15000", "kind_name": "整層住家"},  # wrong kind
+        "2003": {"price": "15000", "kind_name": "雅房"},      # kind 4 equivalent
+        "2004": {"price": "15000", "kind_name": "獨立套房", "area": 4.5},  # too small
+        "2005": {"price": "15000", "kind_name": "分租套房",
+                 "remark": "公共設施完整，嚴禁開伙"},            # cooking banned
+    }
+    for lid, over in bad.items():
+        payload = dict(base, listing_id=lid)
+        raw_search = {"id": int(lid), "title": "x", "price": over.pop("price", "15000")}
+        raw_search.update({k: over.pop(k) for k in ("kind_name", "area") if k in over})
+        meta = {"status": "open"}
+        if over:
+            meta["remark"] = {"content": over["remark"]}
+        payload["raw_search"], payload["raw_metadata"] = raw_search, meta
+        (env["incoming"] / "listings").mkdir(parents=True, exist_ok=True)
+        (env["incoming"] / "listings" / f"{lid}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert main.run_incoming(env["incoming"], -1, do_notify=False) == 0
+    conn = database.connect(env["db_path"])
+    try:
+        for lid in bad:
+            assert conn.execute("SELECT 1 FROM listings WHERE listing_id=?", (lid,)).fetchone() is None
+            assert conn.execute("SELECT 1 FROM relay_state WHERE listing_id=?", (lid,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_heuristic_flags_merge_into_warnings(env):
+    env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: False)
+    lid = "2100"
+    listings = env["incoming"] / "listings"
+    listings.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "listing_id": lid, "detail_failed": False, "payload_sha256": "sha-H",
+        "image_urls": [], "images": [],
+        "raw_search": {"id": int(lid), "title": "t", "price": "12000",
+                       "kind_name": "獨立套房", "area": 7.0},
+        "raw_metadata": {"status": "open",
+                         "remark": {"content": "頂樓加蓋，電費每度6元，需追垃圾車"}},
+    }
+    (listings / f"{lid}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert main.run_incoming(env["incoming"], -1, do_notify=False) == 0
+    row = _row(env, lid)
+    warnings = json.loads(row["qwen_warnings"])
+    assert row["heuristic_score"] == pytest.approx(100 - 15 - 10 - 10)
+    assert any("ILLEGAL_ROOFTOP" in w for w in warnings)
+    assert any("HIGH_ELEC_FEE" in w for w in warnings)
+    assert any("MANUAL_TRASH" in w for w in warnings)
 
 
 def test_extract_text_warnings_rules():

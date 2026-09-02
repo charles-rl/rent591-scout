@@ -25,7 +25,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .client591 import Client591
-from .constants591 import REGIONS, RENT_KINDS, SECTIONS, SECTIONS_BY_REGION
+from .constants591 import (
+    ACCEPTED_RENT_KINDS,
+    REGIONS,
+    RENT_KINDS,
+    SECTIONS,
+    SECTIONS_BY_REGION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +68,13 @@ def _resolve_region_sections(region_name: str, section_name: str) -> tuple[int, 
     if region_id is None:
         raise ValueError(f"unknown region: {region_name!r}; available: {list(REGIONS.values())}")
     if section_name:
+        wanted = list(dict.fromkeys(s.strip() for s in section_name.split(",") if s.strip()))
         section_ids = [
-            sid for sid, (sname, rid) in SECTIONS.items() if sname == section_name and rid == region_id
+            sid for sname in wanted
+            for sid, (s_, rid) in SECTIONS.items() if s_ == sname and rid == region_id
         ]
-        if not section_ids:
-            raise ValueError(f"unknown section {section_name!r} in {region_name}")
+        if len(section_ids) != len(wanted):
+            raise ValueError(f"unknown section(s) {wanted!r} in {region_name}")
     else:
         section_ids = list(SECTIONS_BY_REGION[region_id].keys())
     return region_id, section_ids
@@ -81,44 +89,111 @@ def _resolve_kind(kind_name: str | None) -> int | None:
     return match
 
 
+def _resolve_kinds() -> list[int]:
+    """Kind passes per request (BFF API takes a single int per call)."""
+    if os.environ.get("X591_KIND"):
+        return [_resolve_kind(os.environ["X591_KIND"])]
+    names = [s.strip() for s in os.environ.get("X591_KINDS", "獨立套房,分租套房").split(",") if s.strip()]
+    return [_resolve_kind(n) for n in names]
+
+
+def _resolve_queries() -> list[tuple[int, list[int]]]:
+    """[(region_id, [section_ids])] from X591_QUERIES ('新北:汐止區,三重區;台北市:南港區')
+    or the legacy single X591_REGION/X591_SECTION pair."""
+    spec = os.environ.get("X591_QUERIES", "").strip()
+    if spec:
+        queries = []
+        for part in spec.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            region_name, _, sections = part.partition(":")
+            queries.append(_resolve_region_sections(region_name.strip(), sections.strip()))
+        if queries:
+            return queries
+    return [_resolve_region_sections(
+        os.environ.get("X591_REGION", "台北市"), os.environ.get("X591_SECTION", ""))]
+
+
+# --------------------------------------------------------------------------
+# Stage-1 deterministic hard filters (docs/591research.md §3)
+# Certain violations drop the listing; unknown/ambiguous data is kept (soft).
+# --------------------------------------------------------------------------
+HARD_PRICE_MIN = int(os.environ.get("HARD_PRICE_MIN", "10000"))
+HARD_PRICE_MAX = int(os.environ.get("HARD_PRICE_MAX", "17000"))
+HARD_MIN_AREA_PING = float(os.environ.get("HARD_MIN_AREA_PING", "6.0"))
+ACCEPTED_KIND_NAMES = frozenset(ACCEPTED_RENT_KINDS.values())
+COOKING_PROHIBITIONS = ("嚴禁開伙", "嚴禁開火", "不可開伙", "禁止開伙",
+                        "不可煮食", "禁止煮食", "不可炊煮", "禁止炊煮")
+
+
+def _filters_enabled() -> bool:
+    return os.environ.get("ENFORCE_HARD_FILTERS", "1").lower() not in ("0", "false", "no")
+
+
+def passes_hard_filters(listing: dict) -> tuple[bool, list[str]]:
+    """Return (keep?, reasons). Unknown kind/area never drop — see soft policy."""
+    if not _filters_enabled():
+        return True, []
+    reasons: list[str] = []
+    price = listing.get("price")
+    if not price or price < HARD_PRICE_MIN or price > HARD_PRICE_MAX:
+        reasons.append(f"price {price!r} outside [{HARD_PRICE_MIN},{HARD_PRICE_MAX}]")
+    area = listing.get("area")
+    if area is not None and area < HARD_MIN_AREA_PING:
+        reasons.append(f"area {area} < {HARD_MIN_AREA_PING} ping")
+    kind_name = listing.get("kind_name")
+    if kind_name and kind_name not in ACCEPTED_KIND_NAMES:
+        reasons.append(f"kind {kind_name!r} not in {sorted(ACCEPTED_KIND_NAMES)}")
+    blob = " ".join(filter(None, [
+        str(listing.get("description") or ""),
+        " ".join(str(t) for t in (listing.get("tags") or [])),
+    ]))
+    if any(p in blob for p in COOKING_PROHIBITIONS):
+        reasons.append("explicit cooking prohibition")
+    return (not reasons), reasons
+
+
 # --------------------------------------------------------------------------
 # Fetching
 # --------------------------------------------------------------------------
 def fetch_raw_listings(fixtures: bool = False, limit: int = -1) -> list[dict]:
     """Return list of {"raw_search": item, "raw_metadata": data|None}."""
-    region_name = os.environ.get("X591_REGION", "台北市")
-    section_name = os.environ.get("X591_SECTION", "")
-    kind_name = os.environ.get("X591_KIND", "整層住家")
-    price_str = os.environ.get("X591_PRICE_STR", "15000_25000")
+    price_str = os.environ.get("X591_PRICE_STR", "10000_17000")
     first_pages = int(os.environ.get("X591_FIRST_PAGES", "1"))
 
     if fixtures:
         return _fetch_from_fixtures(limit)
 
-    region_id, section_ids = _resolve_region_sections(region_name, section_name)
-    kind = _resolve_kind(kind_name)
     client = Client591()
     items: list[dict] = []
-    first_row = 0
-    for _ in range(first_pages):
-        result = client.search_rent(
-            region_id=region_id, section_ids=section_ids, kind=kind,
-            price_str=price_str, first_row=first_row,
-        )
-        data = result.get("data", {})
-        page_items = data.get("items", [])
-        items.extend(page_items)
-        if not page_items:
-            break
-        next_row = data.get("firstRow")
-        try:
-            next_row = int(next_row)
-        except (TypeError, ValueError):
-            logger.warning("unexpected firstRow=%r; stopping pagination", data.get("firstRow"))
-            break
-        if next_row == first_row:
-            break
-        first_row = next_row
+    seen_ids: set[str] = set()
+    for region_id, section_ids in _resolve_queries():
+        for kind in _resolve_kinds():
+            first_row = 0
+            for _ in range(first_pages):
+                result = client.search_rent(
+                    region_id=region_id, section_ids=section_ids, kind=kind,
+                    price_str=price_str, first_row=first_row,
+                )
+                data = result.get("data", {})
+                page_items = data.get("items", [])
+                for it in page_items:
+                    iid = str(it.get("id"))
+                    if iid not in seen_ids:
+                        seen_ids.add(iid)
+                        items.append(it)
+                if not page_items:
+                    break
+                next_row = data.get("firstRow")
+                try:
+                    next_row = int(next_row)
+                except (TypeError, ValueError):
+                    logger.warning("unexpected firstRow=%r; stopping pagination", data.get("firstRow"))
+                    break
+                if next_row == first_row:
+                    break
+                first_row = next_row
 
     out: list[dict] = []
     for item in items:
@@ -496,11 +571,18 @@ def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
     (out / "listings").mkdir(parents=True, exist_ok=True)
     skip_images = os.environ.get("RELAY_SKIP_IMAGES", "").lower() in ("1", "true", "yes")
     entries = fetch_raw_listings(fixtures=fixtures, limit=limit)
-    written = skipped = 0
+    written = skipped = filtered = 0
     for entry in entries:
         item = entry.get("raw_search") or {}
         pid = str(item.get("id") or "")
         if not pid or pid == "None":
+            continue
+        keep, reasons = passes_hard_filters(
+            normalize_listing(item, entry.get("raw_metadata"),
+                              detail_failed=bool(entry.get("detail_failed"))))
+        if not keep:
+            logger.info("relay hard-filter drop %s: %s", pid, "; ".join(reasons))
+            filtered += 1
             continue
         urls = fetch_image_urls(item, entry.get("raw_metadata"))
         webp_blobs: dict[int, bytes] = {}
@@ -547,7 +629,8 @@ def dump_relay_payloads(output_dir: str | Path, fixtures: bool = False,
         for ordinal, data in webp_blobs.items():
             _atomic_write_bytes(out / "images" / pid / f"{ordinal:02d}.webp", data)
         written += 1
-    logger.info("relay dump -> %s: %s written, %s unchanged", out, written, skipped)
+    logger.info("relay dump -> %s: %s written, %s unchanged, %s hard-filtered",
+                out, written, skipped, filtered)
     return written
 
 
@@ -565,12 +648,13 @@ def _relay_main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.selftest:
         client = Client591()
-        region_id, section_ids = _resolve_region_sections(
-            os.environ.get("X591_REGION", "台北市"), os.environ.get("X591_SECTION", ""))
-        kind = _resolve_kind(os.environ.get("X591_KIND", "整層住家"))
+        queries = _resolve_queries()
+        kinds = _resolve_kinds()
+        region_id, section_ids = queries[0]
+        kind = kinds[0]
         try:
             result = client.search_rent(region_id=region_id, section_ids=section_ids, kind=kind,
-                                        price_str=os.environ.get("X591_PRICE_STR", "15000_25000"))
+                                        price_str=os.environ.get("X591_PRICE_STR", "10000_17000"))
             data = result.get("data", {})
             print(f"selftest OK: {len(data.get('items', []))} items, "
                   f"totalRows={data.get('totalRows')}, cookies={sorted(client._session.cookies.keys())}")

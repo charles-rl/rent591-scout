@@ -456,3 +456,23 @@ SECTIONS: dict[int, tuple[str, int]] = {
 SECTIONS_BY_REGION: dict[int, dict[int, str]] = {}
 for _sid, (_sname, _rid) in SECTIONS.items():
     SECTIONS_BY_REGION.setdefault(_rid, {})[_sid] = _sname
+
+# ---------------------------------------------------------------------------
+# Target zones & polling tiers (docs/591research.md)
+# ---------------------------------------------------------------------------
+ACCEPTED_RENT_KINDS: dict[int, str] = {2: "獨立套房", 3: "分租套房"}
+
+TARGET_SECTIONS: dict[int, list[int]] = {
+    1: [11, 10, 9, 2, 8],   # Nangang, Neihu, Beitou, Datong, Shilin
+    3: [27, 43, 47, 50, 26],  # Xizhi, Sanchong, Luzhou, Tamsui, Banqiao
+}
+
+# Tier -> {interval_minutes, queries: [(region_id, [section_ids])]}
+POLLING_TIERS: dict[str, dict] = {
+    "tier1": {"interval_minutes": 15,
+              "queries": [(3, [27, 43]), (1, [11])]},
+    "tier2": {"interval_minutes": 60,
+              "queries": [(1, [10, 9, 2, 8]), (3, [47])]},
+    "tier3": {"interval_minutes": 180,
+              "queries": [(3, [50, 26])]},
+}

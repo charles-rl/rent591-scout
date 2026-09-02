@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS listings (
     qwen_warnings JSON, qwen_vision_flags JSON, qwen_direct_score REAL,
     dino_embedding BLOB,
     predicted_score REAL, score_source TEXT,
+    heuristic_score REAL,
     image_status TEXT DEFAULT 'pending',
     text_only_notified BOOLEAN DEFAULT FALSE,
     user_rated BOOLEAN DEFAULT FALSE,
@@ -86,6 +87,7 @@ _EXTRA_COLUMNS = [
     ("is_duplicate", "BOOLEAN DEFAULT FALSE"),
     ("image_status", "TEXT DEFAULT 'pending'"),
     ("text_only_notified", "BOOLEAN DEFAULT FALSE"),
+    ("heuristic_score", "REAL"),
 ]
 
 
@@ -160,7 +162,7 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "social_house", "facilities",
         "description", "image_urls", "image_paths",
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score",
-        "dino_embedding", "predicted_score", "score_source",
+        "dino_embedding", "predicted_score", "score_source", "heuristic_score",
         "image_status",
     ]
     placeholders = ", ".join(
