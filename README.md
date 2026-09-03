@@ -5,6 +5,29 @@ Combines API ingestion (mcp-591), browser fallback scraping (591scraper), local
 DINOv3 image embeddings for deduplication, a local Qwen 27B vision LLM (Ollama),
 an XGBoost scoring head, and ntfy.sh push notifications.
 
+## Credits & License
+
+This project was conceived, designed, and is maintained by **Charles A. Sosmeña**
+(GitHub: [`charles-rl`](https://github.com/charles-rl)). If you find it useful and
+reuse or adapt it anywhere, a credit back would be sincerely appreciated — please
+keep this notice and the [LICENSE](LICENSE) file intact. Thank you!
+
+It proudly stands on the shoulders of these open-source projects:
+
+- **[asgard-ai-platform/mcp-591](https://github.com/asgard-ai-platform/mcp-591)** — MIT License,
+  Copyright (c) 2026 Asgard AI Platform. Fast API-based ingestion; `src/client591.py` and
+  `src/constants591.py` are vendored from it.
+- **[ceshine/591scraper](https://github.com/ceshine/591scraper)** — MIT License,
+  Copyright (c) 2021 CeShine Lee. Browser-driven DOM fallback scraper (`external/591scraper`).
+- **[Meta DINOv3](https://github.com/facebookresearch/dinov3)** (`facebook/dinov3-vitb16-pretrain-lvd1689m`) — image embeddings.
+- **Qwen** vision/language models (Alibaba Qwen Team), served locally via **Ollama**.
+- **[DrissionPage](https://github.com/g1879/DrissionPage)** — headless browser automation.
+  Note: DrissionPage uses a custom **non-commercial** license; commercial use requires the
+  author's permission (this repo's own MIT license does not override that).
+
+This repository's own code is released under the **MIT License** (see [LICENSE](LICENSE));
+all third-party components remain under their respective licenses.
+
 ## Architecture
 
 ```
