@@ -125,6 +125,7 @@ HARD_MIN_AREA_PING = float(os.environ.get("HARD_MIN_AREA_PING", "6.0"))
 ACCEPTED_KIND_NAMES = frozenset(ACCEPTED_RENT_KINDS.values())
 COOKING_PROHIBITIONS = ("嚴禁開伙", "嚴禁開火", "不可開伙", "禁止開伙",
                         "不可煮食", "禁止煮食", "不可炊煮", "禁止炊煮")
+GENDER_RESTRICTION_RE = re.compile(r"(?<!不)限[男女]|(?<!不)[男女](?:性|生)?限")
 
 
 def _filters_enabled() -> bool:
@@ -151,6 +152,11 @@ def passes_hard_filters(listing: dict) -> tuple[bool, list[str]]:
     ]))
     if any(p in blob for p in COOKING_PROHIBITIONS):
         reasons.append("explicit cooking prohibition")
+    gender = str(listing.get("gender") or "")
+    gmatch = (GENDER_RESTRICTION_RE.search(gender)
+              or GENDER_RESTRICTION_RE.search(f"{listing.get('title') or ''} {blob}"))
+    if gmatch:
+        reasons.append(f"gender-restricted listing ({gender or gmatch.group(0)})")
     return (not reasons), reasons
 
 
@@ -318,6 +324,12 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None,
         facilities.append("不可養寵物")
     elif "可養" in pet_text and "可養寵物" not in facilities:
         facilities.append("可養寵物")
+    gender_values = [
+        str(entry.get("value") or entry.get("name") or "")
+        for entry in list((data.get("houseInfo") or {}).get("data", [])) + list(facility.get("notice") or [])
+        if isinstance(entry, dict) and str(entry.get("key") or "").split("_")[0] == "sex"
+    ]
+    gender = next((g.strip() for g in gender_values if g.strip()), None)
     social_house = item.get("social_house") or (data.get("favData") or {}).get("socialHouse")
     social_house = bool(int(social_house)) if isinstance(social_house, (int, str)) else None
 
@@ -360,6 +372,7 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None,
         "contain_cost": contain,
         "social_house": social_house,
         "facilities": facilities,
+        "gender": gender,
         "description": description or "",
         "raw_search": item,
         "raw_metadata": data,

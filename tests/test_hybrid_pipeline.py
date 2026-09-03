@@ -74,6 +74,68 @@ def _row(env, lid):
         conn.close()
 
 
+def test_gender_restricted_hard_filter(env):
+    env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: False)
+    cases = {
+        "2010": {"houseInfo": {"data": [{"key": "sex", "name": "性別", "value": "限女生"}]}},
+        "2011": {"service": {"notice": [{"key": "sex_2", "name": "限男性"}]}},
+        "2012": {"houseInfo": {"data": [{"key": "sex", "name": "性別", "value": "不拘"}]}},
+        "2013": {"service": {"notice": [{"key": "pet", "name": "可養寵物"}]}},
+    }
+    (env["incoming"] / "listings").mkdir(parents=True, exist_ok=True)
+    for lid, extra in cases.items():
+        payload = {"listing_id": lid, "detail_failed": False, "payload_sha256": f"sha-{lid}",
+                   "image_urls": [], "images": [],
+                   "raw_search": {"id": int(lid), "title": "x", "price": "15000",
+                                  "kind_name": "獨立套房", "area": 8.0},
+                   "raw_metadata": dict({"status": "open"}, **extra)}
+        (env["incoming"] / "listings" / f"{lid}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert main.run_incoming(env["incoming"], -1, do_notify=False) == 0
+    conn = database.connect(env["db_path"])
+    try:
+        for lid in ("2010", "2011"):
+            assert conn.execute("SELECT 1 FROM listings WHERE listing_id=?", (lid,)).fetchone() is None
+            assert conn.execute("SELECT 1 FROM relay_state WHERE listing_id=?", (lid,)).fetchone() is not None
+        for lid in ("2012", "2013"):
+            assert conn.execute("SELECT 1 FROM listings WHERE listing_id=?", (lid,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_normalize_extracts_gender():
+    restricted = ingestion.normalize_listing(
+        {"id": 1, "title": "x", "price": "12500"},
+        {"status": "open", "service": {"notice": [{"key": "sex_2", "name": "限女生"}]}})
+    assert restricted["gender"] == "限女生"
+    assert ingestion.passes_hard_filters(restricted)[0] is False
+    any_gender = ingestion.normalize_listing(
+        {"id": 2, "title": "x", "price": "12500"},
+        {"status": "open", "houseInfo": {"data": [{"key": "sex", "value": "不拘"}]}})
+    assert any_gender["gender"] == "不拘"
+    assert ingestion.passes_hard_filters(any_gender)[0] is True
+    absent = ingestion.normalize_listing({"id": 3, "title": "鄰居都女性", "price": "12500"},
+                                         {"status": "open"})
+    assert absent["gender"] is None
+    assert ingestion.passes_hard_filters(absent)[0] is True
+    variant = ingestion.normalize_listing(
+        {"id": 4, "title": "x", "price": "12500"},
+        {"status": "open", "houseInfo": {"data": [{"key": "sex", "value": "女性限定"}]}})
+    assert ingestion.passes_hard_filters(variant)[0] is False
+    in_title = ingestion.normalize_listing(
+        {"id": 5, "title": "近捷運(限女性)套房", "price": "12500"}, {"status": "open"})
+    assert ingestion.passes_hard_filters(in_title)[0] is False
+    open_to_all = ingestion.normalize_listing(
+        {"id": 6, "title": "x", "price": "12500"},
+        {"status": "open", "remark": {"content": "不限男女，學生上班族皆可"}})
+    assert ingestion.passes_hard_filters(open_to_all)[0] is True
+    any_wording = ingestion.normalize_listing(
+        {"id": 7, "title": "x", "price": "12500"},
+        {"status": "open", "remark": {"content": "性別限制：不拘"}})
+    assert ingestion.passes_hard_filters(any_wording)[0] is True
+
+
 def test_hard_filters_drop_noncompliant_incoming(env):
     env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: False)
     base = {"listing_id": None, "detail_failed": False, "payload_sha256": "s",

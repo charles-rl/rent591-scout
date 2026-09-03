@@ -13,6 +13,7 @@ the user confirms). `rate.py` itself stays a dumb recorder — it never edits co
 | Comment character | Destination | Where |
 |---|---|---|
 | Verifiable from structured fields (`facilities`, `contain_cost`, `price`, `floor`, `shape`) or stable text patterns in description/tags | Deterministic penalty | `src/scoring.py` `heuristic_penalties()` + `PENALTY_POINTS`/`PENALTY_MESSAGES` |
+| Disqualifying constraint the user states outright (e.g. "only females allowed ... as a constraint") | Deterministic hard filter (drop, never alerted) | `src/ingestion.py` `passes_hard_filters()` (enforced on relay + incoming sides) |
 | Structured metadata the pipeline currently drops (e.g. 591 `houseInfo` pet entry) | Ingestion fix first, then penalty | `src/ingestion.py` `normalize_listing()` -> `facilities` |
 | Needs judgment over images/unstructured nuance (bathroom quality, light, "vibe", clutter) | Dynamic prompt bullet | `dynamic_prompt.update_preferences()` -> Qwen system prompt |
 | Numeric thresholds the user quotes (e.g. ">15600") | Module constant / env var next to the rule, never hardcoded in prose | `src/scoring.py` |
@@ -39,6 +40,28 @@ If two reasonable people could disagree about it, it is a prompt bullet.
 - `NO_PETS` and `ELEC_EXTRA_HIGH_COST` are now `FEATURE_NAMES` inputs (vector 14 -> 16).
   `_load_trained_model()` detects the width change and retrains the saved head
   automatically once enough ratings accumulate.
+
+## Worked example (reviews 21927820 / 21918067 — female-only)
+
+- "Only females allowed, should be included as a constraint" (twice, me + partner) —
+  **hard filter**, not a penalty: `normalize_listing()` now extracts the structured
+  591 gender entry (`houseInfo.data[key=sex]` / `service.notice[key=sex_2]`) into
+  `listing["gender"]`, and `passes_hard_filters()` drops any value matching
+  `GENDER_RESTRICTION_RE` (`限[男女]`). Both filter call sites (relay dump, incoming
+  ingest) share these functions, so relay/incoming stay in sync automatically.
+  No scoring flag and no `FEATURE_NAMES` change — excluded listings never reach scoring.
+  Evidence is structured fields only: "鄰居都女性" titles and permissive values
+  ("不拘", "男女皆可") never drop.
+- 21938817 "Little detail about the shared apartment" — prompt bullet, added
+  manually ("Flag listings that provide little detail about shared/common areas")
+  because Qwen consolidation silently kept the list unchanged; the consolidation
+  auto-added "female-only ... constraint" bullet was removed as a duplicate of the
+  code rule above.
+- 21864342 "Shared apartment" (3.0/2.5) — nothing routed: user chose to keep current
+  filters, treated as pure training signal. Consolidation had inverted the sentiment
+  ("Prefer shared apartments", "Prefer no-pets-only listings" from a rating that was
+  fine *despite* NO_PETS) — both removed manually. Lesson: always audit the bullets
+  after consolidating terse negative feedback.
 
 ## Adding a new deterministic rule (checklist)
 

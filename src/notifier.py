@@ -144,7 +144,14 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
     url = str(listing.get("url") or "")
     price = listing.get("price") or "—"
     posted = _posted_en(listing.get("refresh_time"))
-    price_line = f"NT${price}/mo | Rating {predicted_score:.2f}/5"
+    source_tag = {"xgboost": "XGBoost", "qwen": "vision"}.get(str(listing.get("score_source") or ""))
+    heur = listing.get("heuristic_score")
+    rating = f"Rating {predicted_score:.2f}/5"
+    if source_tag:
+        rating += f" ({source_tag})"
+    if heur is not None:
+        rating += f" | heuristic {float(heur):.2f}/5"
+    price_line = f"NT${price}/mo | {rating}"
     if posted:
         price_line += f" | {posted}"
     message = (
@@ -154,7 +161,8 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
         f"{url}"
     )
     headers = {
-        "Title": _header_safe(f"Apartment Match ({predicted_score:.2f}/5)"),
+        "Title": _header_safe(f"Apartment Match ({predicted_score:.2f}/5"
+                              f"{' ' + source_tag if source_tag else ''})"),
         "Click": _header_safe(url),
         "Tags": "house,bathroom",
     }

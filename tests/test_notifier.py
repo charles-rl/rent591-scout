@@ -84,3 +84,29 @@ def test_alert_message_includes_posted_date(monkeypatch):
 
     notifier.send_ntfy_alert({"listing_id": "2", "title": "t", "url": "u"}, 4.0, 3.5)
     assert "Posted" not in captured["message"]
+
+
+def test_alert_labels_score_source(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None, proxies=None):
+        captured["message"] = data.decode("utf-8")
+        captured["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+    listing = {"listing_id": "3", "title": "t", "url": "u",
+               "score_source": "xgboost", "heuristic_score": 3.8}
+    assert notifier.send_ntfy_alert(listing, 4.25, 3.5) is True
+    assert "Rating 4.25/5 (XGBoost)" in captured["message"]
+    assert "heuristic 3.80/5" in captured["message"]
+    assert captured["headers"]["Title"] == "Apartment Match (4.25/5 XGBoost)"
+
+    notifier.send_ntfy_alert({"listing_id": "4", "title": "t", "url": "u",
+                              "score_source": "qwen", "heuristic_score": 3.8}, 4.0, 3.5)
+    assert "Rating 4.00/5 (vision)" in captured["message"]
+
+    notifier.send_ntfy_alert({"listing_id": "5", "title": "t", "url": "u"}, 4.0, 3.5)
+    assert "Rating 4.00/5" in captured["message"]
+    assert "heuristic" not in captured["message"]
+    assert captured["headers"]["Title"] == "Apartment Match (4.00/5)"
