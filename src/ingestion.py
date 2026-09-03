@@ -308,6 +308,16 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None,
         f.get("name") for f in facility.get("facility", [])
         if isinstance(f, dict) and f.get("active")
     ]
+    pet_values = [
+        str(entry.get("value") or entry.get("name") or "")
+        for entry in list((data.get("houseInfo") or {}).get("data", [])) + list(facility.get("notice") or [])
+        if isinstance(entry, dict) and entry.get("key") == "pet"
+    ]
+    pet_text = "".join(pet_values)
+    if any(t in pet_text for t in ("不可", "禁")) and "不可養寵物" not in facilities:
+        facilities.append("不可養寵物")
+    elif "可養" in pet_text and "可養寵物" not in facilities:
+        facilities.append("可養寵物")
     social_house = item.get("social_house") or (data.get("favData") or {}).get("socialHouse")
     social_house = bool(int(social_house)) if isinstance(social_house, (int, str)) else None
 

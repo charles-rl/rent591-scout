@@ -57,3 +57,30 @@ def test_below_threshold_sends_nothing(posts):
     _, calls = posts
     assert notifier.send_ntfy_alert({"listing_id": "1"}, 2.0, 3.5, proxy="http://p") is False
     assert calls == []
+
+
+def test_posted_en_translates_refresh_time():
+    assert notifier._posted_en("此房屋在8月18日發佈") == "Posted Aug 18"
+    assert notifier._posted_en("此房屋在1天前發佈") == "Posted 1 day ago"
+    assert notifier._posted_en("此房屋在3天前更新") == "Updated 3 days ago"
+    assert notifier._posted_en("此房屋在12小時前發佈") == "Posted 12 hours ago"
+    assert notifier._posted_en("此房屋在1週前發佈") == "Posted 1 week ago"
+    assert notifier._posted_en("") == ""
+    assert notifier._posted_en(None) == ""
+
+
+def test_alert_message_includes_posted_date(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None, proxies=None):
+        captured["message"] = data.decode("utf-8")
+        return _Resp()
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+    assert notifier.send_ntfy_alert(
+        {"listing_id": "1", "title": "t", "url": "u", "refresh_time": "此房屋在2天前發佈"}, 4.0, 3.5
+    ) is True
+    assert "Posted 2 days ago" in captured["message"]
+
+    notifier.send_ntfy_alert({"listing_id": "2", "title": "t", "url": "u"}, 4.0, 3.5)
+    assert "Posted" not in captured["message"]

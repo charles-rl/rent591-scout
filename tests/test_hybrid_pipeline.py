@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 import main
-from src import database
+from src import database, ingestion
 
 PROXY = "http://127.0.0.1:8999"
 VISION_OK = {
@@ -139,6 +139,27 @@ def test_extract_text_warnings_rules():
     assert any("Utilities" in x for x in w)
     assert "6-month upfront payment required" in w
     assert main.extract_text_warnings({"floor": "3樓", "description": "", "deposit": "押一"}) == []
+
+
+def test_normalize_maps_structured_pet_to_facilities():
+    listing = ingestion.normalize_listing(
+        {"id": 1, "title": "t", "price": "12000"},
+        {"status": "open",
+         "houseInfo": {"data": [{"key": "pet", "name": "寵物", "value": "不可養寵物"}]},
+         "service": {"notice": [{"key": "pet", "name": "不可養寵物"}]}},
+    )
+    assert "不可養寵物" in listing["facilities"]
+    listing = ingestion.normalize_listing(
+        {"id": 2, "title": "t", "price": "12000"},
+        {"status": "open",
+         "houseInfo": {"data": [{"key": "pet", "name": "寵物", "value": "可養貓狗"}]}},
+    )
+    assert "可養寵物" in listing["facilities"]
+    listing = ingestion.normalize_listing(
+        {"id": 3, "title": "t", "price": "12000"},
+        {"status": "open", "houseInfo": {"data": [{"key": "area", "name": "坪數", "value": "8"}]}},
+    )
+    assert listing["facilities"] == []
 
 
 def test_offline_stores_pending_and_alerts_once(env):

@@ -48,4 +48,4 @@ Dedup tests need real image content: DINOv3 CLS collapses on textureless synthet
 
 ## Deeper docs
 
-`README.md` (hybrid proxy mode details), `IMPLEMENTATION_OUTLINE.md`, `docs/591research.md` (polling tiers §5), `docs/BUILD_PLAN.md`.
+`README.md` (hybrid proxy mode details), `IMPLEMENTATION_OUTLINE.md`, `docs/591research.md` (polling tiers §5), `docs/BUILD_PLAN.md`, `docs/feedback-triage.md` (rating comments: deterministic-code vs dynamic-prompt routing; triage happens in-chat, not in `rate.py`).

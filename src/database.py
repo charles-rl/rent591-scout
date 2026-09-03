@@ -233,14 +233,14 @@ def get_rating_count(conn: sqlite3.Connection) -> int:
 def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, user_score, qwen_direct_score, "
-        "price, area, floor, shape, tags, description FROM listings WHERE user_rated = 1"
+        "price, area, floor, shape, tags, facilities, contain_cost, description FROM listings WHERE user_rated = 1"
     ).fetchall()
 
 
 def get_scoring_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score, "
-        "price, area, floor, shape, tags, description "
+        "price, area, floor, shape, tags, facilities, contain_cost, description "
         "FROM listings WHERE IFNULL(user_rated, 0) != 1"
     ).fetchall()
 

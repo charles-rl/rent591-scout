@@ -4,7 +4,8 @@ Phase 1 (<=RATED_THRESHOLD labeled samples): predicted_score = qwen_direct_score
 Phase 2 (>RATED_THRESHOLD): XGBRegressor over the compressed fusion vector -> user_score:
 [dino_visual_score (Layer 1 scalar); qwen_score = (qwen_direct_score-1)/4;
 5 vision flags + 1 has-warnings bit; tabular: log1p price / area_ping / price_per_ping /
-floor_num; HIGH_ELEC_FEE; MANUAL_TRASH] (FEATURE_NAMES). The raw 768-d DINOv3 vector is
+floor_num; HIGH_ELEC_FEE; MANUAL_TRASH; NO_PETS; ELEC_EXTRA_HIGH_COST] (FEATURE_NAMES).
+The raw 768-d DINOv3 vector is
 compressed to dino_visual_score by src/visual_preference.py, never concatenated directly.
 
 Also hosts the Stage-3 deterministic penalty engine (docs/591research.md §4):
@@ -82,7 +83,7 @@ FEATURE_NAMES = [
     "has_bathroom_img", "shower_sink_combo", "drainage_risk", "has_kitchen_sink",
     "has_exterior_window", "has_warnings",
     "log_price", "area_ping", "price_per_ping", "floor_num",
-    "HIGH_ELEC_FEE", "MANUAL_TRASH",
+    "HIGH_ELEC_FEE", "MANUAL_TRASH", "NO_PETS", "ELEC_EXTRA_HIGH_COST",
 ]
 
 
@@ -123,6 +124,8 @@ def tabular_vector(listing: dict | None) -> np.ndarray:
         parse_floor_number(listing.get("floor")),
         1.0 if "HIGH_ELEC_FEE" in penalty_flags else 0.0,
         1.0 if "MANUAL_TRASH" in penalty_flags else 0.0,
+        1.0 if "NO_PETS" in penalty_flags else 0.0,
+        1.0 if "ELEC_EXTRA_HIGH_COST" in penalty_flags else 0.0,
     ]
     return np.asarray(vec, dtype=np.float32)
 
@@ -141,6 +144,8 @@ def _row_listing(row) -> dict:
     return {
         "price": row["price"], "area": row["area"], "floor": row["floor"],
         "shape": row["shape"], "tags": _load_json(row["tags"], []),
+        "facilities": _load_json(row["facilities"], []),
+        "contain_cost": _load_json(row["contain_cost"], []),
         "description": row["description"],
     }
 
@@ -152,8 +157,16 @@ def _row_features(row, visual_score: float) -> np.ndarray:
 
 
 def _load_trained_model(conn) -> xgb.XGBRegressor:
-    if not MODEL_PATH.exists():
-        train_and_save(conn)
+    if MODEL_PATH.exists():
+        model = xgb.XGBRegressor()
+        model.load_model(str(MODEL_PATH))
+        if model.get_booster().num_features() != len(FEATURE_NAMES):
+            logger.warning("saved model has %d features, FEATURE_NAMES has %d -> retraining",
+                           model.get_booster().num_features(), len(FEATURE_NAMES))
+            train_and_save(conn)
+            model.load_model(str(MODEL_PATH))
+        return model
+    train_and_save(conn)
     model = xgb.XGBRegressor()
     model.load_model(str(MODEL_PATH))
     return model
@@ -233,6 +246,7 @@ def score_all_unrated(conn) -> int:
 # listings keep 100 and are surfaced to the user via warnings instead.
 # --------------------------------------------------------------------------
 HEURISTIC_BASELINE = 100.0
+ELEC_EXTRA_COST_RENT = float(os.environ.get("ELEC_EXTRA_COST_RENT", "15600"))
 PENALTY_POINTS: dict[str, int] = {
     "HIGH_ELEC_FEE": -15,
     "NO_PETS": -10,
@@ -240,6 +254,7 @@ PENALTY_POINTS: dict[str, int] = {
     "ILLEGAL_ROOFTOP": -10,
     "MANUAL_TRASH": -10,
     "SHARED_WASHER": -5,
+    "ELEC_EXTRA_HIGH_COST": -10,
 }
 PENALTY_MESSAGES: dict[str, str] = {
     "HIGH_ELEC_FEE": "Electricity billed above 5 NTD/kWh",
@@ -248,13 +263,16 @@ PENALTY_MESSAGES: dict[str, str] = {
     "ILLEGAL_ROOFTOP": "Suspected illegal rooftop addition",
     "MANUAL_TRASH": "Manual trash disposal (garbage-truck chasing)",
     "SHARED_WASHER": "Shared / coin-operated laundry",
+    "ELEC_EXTRA_HIGH_COST": f"Rent over {ELEC_EXTRA_COST_RENT:,.0f} with electricity billed separately",
 }
-_PET_PATTERNS = ("不可寵", "禁寵", "嚴禁寵物")
+_PET_PATTERNS = ("不可寵", "禁寵", "嚴禁寵物", "不可養寵", "不開放寵")
 _ROOFTOP_PATTERNS = ("頂樓加蓋", "頂加", "鐵皮加蓋")
 _TRASH_PATTERNS = ("追垃圾車",)
 _WASHER_PATTERNS = ("投幣洗衣", "投幣式洗衣", "共享洗衣")
 _ELEC_RATE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:元|塊|NTD?|TWD?)\s*/\s*(?:度|kwh)", re.IGNORECASE)
 _ELEC_PER_RE = re.compile(r"(?:每|一)\s*度\s*(?:是|為|=)?\s*(\d+(?:\.\d+)?)")
+_ELEC_REVERSED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*度\s*(\d+(?:\.\d+)?)\s*(?:元|塊|NTD?|TWD?)", re.IGNORECASE)
+_ELEC_INCLUDED_PATTERNS = ("含電費", "電費含", "含水電", "水電含", "免電費", "電費免")
 _FLOOR_RE = re.compile(r"(\d+)")
 
 
@@ -262,9 +280,11 @@ def heuristic_penalties(listing: dict) -> list[str]:
     blob = " ".join(filter(None, [
         str(listing.get("description") or ""),
         " ".join(str(t) for t in (listing.get("tags") or [])),
+        " ".join(str(f) for f in (listing.get("facilities") or [])),
     ]))
     flags: list[str] = []
     rates = [float(m.group(1)) for rx in (_ELEC_RATE_RE, _ELEC_PER_RE) for m in rx.finditer(blob)]
+    rates += [float(m.group(2)) for m in _ELEC_REVERSED_RE.finditer(blob)]
     if any(r > 5.0 for r in rates):
         flags.append("HIGH_ELEC_FEE")
     if any(p in blob for p in _PET_PATTERNS):
@@ -280,7 +300,21 @@ def heuristic_penalties(listing: dict) -> list[str]:
     fm = _FLOOR_RE.search(str(listing.get("floor") or ""))
     if fm and int(fm.group(1)) >= 5 and not has_elevator:
         flags.append("HIGH_WALKUP")
+    if _num(listing.get("price")) > ELEC_EXTRA_COST_RENT and not _electricity_included(listing, blob):
+        flags.append("ELEC_EXTRA_HIGH_COST")
     return flags
+
+
+def _electricity_included(listing: dict, blob: str) -> bool:
+    """True when rent demonstrably covers electricity (contain_cost entry or description wording)."""
+    contain = listing.get("contain_cost") or []
+    if isinstance(contain, str):
+        contain = _load_json(contain, [])
+    for entry in contain:
+        text = str(entry if isinstance(entry, str) else (entry or {}).get("name") or (entry or {}).get("value"))
+        if "電費" in text:
+            return True
+    return any(p in blob for p in _ELEC_INCLUDED_PATTERNS)
 
 
 def compute_heuristic_score(listing: dict) -> tuple[float, list[str]]:

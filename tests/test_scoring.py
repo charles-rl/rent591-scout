@@ -82,7 +82,7 @@ def test_fusion_vector_layout():
     listing = {"price": 12000, "area": 8.0, "floor": "5樓", "shape": "公寓",
                "description": "電費6元/度，需追垃圾車"}
     vec = scoring.fusion_vector(0.7, 3.0, FLAGS_A, ["w"], listing)
-    assert vec.shape == (len(scoring.FEATURE_NAMES),) == (14,)
+    assert vec.shape == (len(scoring.FEATURE_NAMES),) == (16,)
     assert vec[0] == pytest.approx(0.7)                      # dino_visual_score
     assert vec[1] == pytest.approx(0.5)                      # qwen_score = (3-1)/4
     np.testing.assert_allclose(vec[2:8], scoring.flag_vector(FLAGS_A, ["w"]))
@@ -91,8 +91,9 @@ def test_fusion_vector_layout():
     assert vec[10] == pytest.approx(1500.0)                  # price per ping
     assert vec[11] == pytest.approx(5.0)
     assert vec[12] == 1.0 and vec[13] == 1.0                 # HIGH_ELEC_FEE / MANUAL_TRASH
+    assert vec[14] == 0.0 and vec[15] == 0.0                 # NO_PETS / ELEC_EXTRA_HIGH_COST
     empty = scoring.fusion_vector(0.0, None, None, None, None)
-    assert empty.shape == (14,) and empty[1] == pytest.approx(0.5)  # neutral qwen_score
+    assert empty.shape == (16,) and empty[1] == pytest.approx(0.5)  # neutral qwen_score
 
 
 def test_parse_floor_number():
@@ -101,6 +102,30 @@ def test_parse_floor_number():
     assert scoring.parse_floor_number("地下2樓") == -2.0
     assert scoring.parse_floor_number("B1") == -1.0
     assert scoring.parse_floor_number(None) == 0.0
+
+
+def test_no_pets_detected_from_facilities_and_wording():
+    assert "NO_PETS" in scoring.heuristic_penalties({"facilities": ["不可養寵物"]})
+    assert "NO_PETS" in scoring.heuristic_penalties({"description": "為維護品質不可養寵物和吸煙"})
+    assert "NO_PETS" in scoring.heuristic_penalties({"description": "不開放寵物"})
+    assert "NO_PETS" not in scoring.heuristic_penalties({"facilities": ["可養寵物"]})
+
+
+def test_elec_rate_reversed_wording_flags_high_fee():
+    assert "HIGH_ELEC_FEE" in scoring.heuristic_penalties({"description": "獨立電表（電費1度6元）"})
+    assert "HIGH_ELEC_FEE" not in scoring.heuristic_penalties({"description": "電費1度4元"})
+
+
+def test_elec_extra_high_cost_rule():
+    base = {"description": "獨立套房"}
+    assert "ELEC_EXTRA_HIGH_COST" in scoring.heuristic_penalties({**base, "price": 16000})
+    assert "ELEC_EXTRA_HIGH_COST" not in scoring.heuristic_penalties({**base, "price": 15000})
+    assert "ELEC_EXTRA_HIGH_COST" not in scoring.heuristic_penalties(
+        {**base, "price": 16000, "contain_cost": ["含電費"]})
+    assert "ELEC_EXTRA_HIGH_COST" not in scoring.heuristic_penalties(
+        {**base, "price": 16000, "description": "租金含電費"})
+    assert "ELEC_EXTRA_HIGH_COST" in scoring.heuristic_penalties(
+        {**base, "price": 16000, "contain_cost": "[{\"name\": \"含清潔費\"}]"})
 
 
 def test_as_embedding_pads_and_truncates():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import requests
 
@@ -105,6 +106,28 @@ def _summary(listing: dict) -> str:
     )
 
 
+_POST_MONTH_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_POST_REL_RE = re.compile(r"(\d+)\s*(分鐘|分钟|小時|小时|天|週|周)\s*前")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_REL_EN = {"分鐘": "min", "分钟": "min", "小時": "hour", "小时": "hour", "天": "day", "週": "week", "周": "week"}
+
+
+def _posted_en(refresh_time) -> str:
+    """591 refresh_time is Chinese free text ('此房屋在8月18日發佈') -> English label or ''."""
+    text = str(refresh_time or "")
+    verb = "Updated" if "更新" in text else "Posted"
+    m = _POST_MONTH_RE.search(text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{verb} {_MONTHS[month - 1]} {day}"
+    m = _POST_REL_RE.search(text)
+    if m:
+        n, unit = int(m.group(1)), _REL_EN[m.group(2)]
+        return f"{verb} {n} {unit}{'s' if n != 1 else ''} ago"
+    return ""
+
+
 def send_ntfy_alert(listing: dict, predicted_score: float | None = None, threshold: float = 3.5,
                     proxy: str | None = None) -> bool:
     """Push an ntfy.sh alert for a high-scoring match. Non-fatal: returns False on failure.
@@ -120,9 +143,13 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
     warnings_str = " | ".join(warnings) if warnings else "No major issues"
     url = str(listing.get("url") or "")
     price = listing.get("price") or "—"
+    posted = _posted_en(listing.get("refresh_time"))
+    price_line = f"NT${price}/mo | Rating {predicted_score:.2f}/5"
+    if posted:
+        price_line += f" | {posted}"
     message = (
         f"{_summary(listing)}\n"
-        f"NT${price}/mo | Rating {predicted_score:.2f}/5\n"
+        f"{price_line}\n"
         f"⚠️ {warnings_str}\n"
         f"{url}"
     )
