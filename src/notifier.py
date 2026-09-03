@@ -150,7 +150,7 @@ def send_ntfy_alert(listing: dict, predicted_score: float | None = None, thresho
     if source_tag:
         rating += f" ({source_tag})"
     if heur is not None:
-        rating += f" | heuristic {float(heur):.2f}/5"
+        rating += f" | heuristic {float(heur):.0f}/100"
     price_line = f"NT${price}/mo | {rating}"
     if posted:
         price_line += f" | {posted}"

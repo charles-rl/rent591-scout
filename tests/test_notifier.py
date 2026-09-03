@@ -96,14 +96,14 @@ def test_alert_labels_score_source(monkeypatch):
 
     monkeypatch.setattr(notifier.requests, "post", fake_post)
     listing = {"listing_id": "3", "title": "t", "url": "u",
-               "score_source": "xgboost", "heuristic_score": 3.8}
+               "score_source": "xgboost", "heuristic_score": 90.0}
     assert notifier.send_ntfy_alert(listing, 4.25, 3.5) is True
     assert "Rating 4.25/5 (XGBoost)" in captured["message"]
-    assert "heuristic 3.80/5" in captured["message"]
+    assert "heuristic 90/100" in captured["message"]
     assert captured["headers"]["Title"] == "Apartment Match (4.25/5 XGBoost)"
 
     notifier.send_ntfy_alert({"listing_id": "4", "title": "t", "url": "u",
-                              "score_source": "qwen", "heuristic_score": 3.8}, 4.0, 3.5)
+                              "score_source": "qwen", "heuristic_score": 45.0}, 4.0, 3.5)
     assert "Rating 4.00/5 (vision)" in captured["message"]
 
     notifier.send_ntfy_alert({"listing_id": "5", "title": "t", "url": "u"}, 4.0, 3.5)
