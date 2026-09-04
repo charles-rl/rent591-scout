@@ -48,6 +48,10 @@ _SECTION_EN = {
     "淡水區": "Tamsui", "板橋區": "Banqiao",
     "台北市": "Taipei", "新北市": "New Taipei",
 }
+_SECTION_RANK = {  # commute-priority ranks from docs/591research.md §1
+    "汐止區": 1, "三重區": 2, "南港區": 3, "內湖區": 4, "北投區": 5,
+    "大同區": 6, "士林區": 7, "蘆洲區": 8, "淡水區": 9, "板橋區": 10,
+}
 _KIND_EN = {
     "套房": "private suite", "整層住家": "whole flat", "分租套房": "suite in shared house",
     "雅房": "partition room", "店面": "storefront", "事務所": "office",
@@ -96,6 +100,9 @@ def _summary(listing: dict) -> str:
     layout = str(listing.get("layout") or "").replace("房", "BR ").replace("廳", "LR ").replace("衛浴", "BA").replace("衛", "BA")
     floor = str(listing.get("floor") or "").replace("頂樓", "top floor").replace("頂層", "top floor").replace("樓", "F")
     section = _SECTION_EN.get(listing.get("section") or "", listing.get("section") or "")
+    rank = _SECTION_RANK.get(listing.get("section") or "")
+    if section and rank:
+        section = f"{section} #{rank}"
     region = _SECTION_EN.get(listing.get("region") or "", "")
     where = _en_line(section, region)
     area = listing.get("area")

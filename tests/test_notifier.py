@@ -110,3 +110,23 @@ def test_alert_labels_score_source(monkeypatch):
     assert "Rating 4.00/5" in captured["message"]
     assert "heuristic" not in captured["message"]
     assert captured["headers"]["Title"] == "Apartment Match (4.00/5)"
+
+
+def test_alert_shows_district_rank(monkeypatch):
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None, proxies=None):
+        captured["message"] = data.decode("utf-8")
+        return _Resp()
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+    notifier.send_ntfy_alert(
+        {"listing_id": "6", "title": "t", "url": "u",
+         "section": "汐止區", "region": "新北市"}, 4.0, 3.5
+    )
+    assert "Xizhi #1" in captured["message"]
+
+    notifier.send_ntfy_alert(
+        {"listing_id": "7", "title": "t", "url": "u", "section": "三峽區"}, 4.0, 3.5
+    )
+    assert " #" not in captured["message"]
