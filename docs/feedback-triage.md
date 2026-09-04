@@ -63,6 +63,31 @@ If two reasonable people could disagree about it, it is a prompt bullet.
   fine *despite* NO_PETS) — both removed manually. Lesson: always audit the bullets
   after consolidating terse negative feedback.
 
+## Rating intake + availability ranking (`scripts/rank_unrated.py`)
+
+The standing post-rating workflow: record the ratings, then ask which listings
+are still worth viewing. One command does the whole loop (the agent can just run it):
+
+1. Record each rating with `rate.py` (bathroom score too — feeds the bath probe):
+   `.venv/bin/python rate.py --id <591ID> --score N [--bathroom M] [--comment "..."]`.
+   Past RATED_THRESHOLD=20, every rating retrains the XGBoost head automatically.
+   Comments (if any) get triaged here per this doc before/while recording.
+2. Run `.venv/bin/python scripts/rank_unrated.py`:
+   - probes every **active unrated** listing URL through the PC devtunnel proxy
+     and marks positive delisting evidence (404/410 or 物件已下架 markers) as
+     `is_active=0` (fail-open on transport errors — an unreachable probe is not a
+     delist, matching `health_check` semantics). Skipped automatically when the
+     proxy probe fails; `--no-probe` forces skip.
+   - re-scores all unrated listings with the current head (`score_all_unrated`)
+     and prints **TOP / MIDDLE / BOTTOM N** (default 5, `--n K`) of what's available,
+     each with location/price/ping/floor/kind + warning flags; `[DUP]` marks DINOv3
+     duplicates. `--retrain` forces a head retrain first (only needed when the
+     width check didn't already fire).
+
+Reply to the user with the three tables as-is. MIDDLE block is the median ±N/2 —
+useful for "what's average" when the top of the list is too good to be true and
+the bottom is mostly penalty-driven rejects (頂層加蓋 / NO_PETS / HIGH_WALKUP).
+
 ## Adding a new deterministic rule (checklist)
 
 1. `scoring.py`: flag name (UPPER_SNAKE), `PENALTY_POINTS`, `PENALTY_MESSAGES`
