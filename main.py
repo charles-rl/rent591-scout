@@ -26,6 +26,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src import (
+    bathroom_detect,
+    bathroom_probe,
     database,
     deduplication,
     dynamic_prompt,
@@ -166,6 +168,16 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
         database.replace_images(conn, listing["listing_id"], image_rows)
         baseline[listing["listing_id"]] = list(new_vecs.values())
         return "duplicate"
+
+    # Bathroom layer: Qwen photo labels (persisted for probe retraining, fail-soft)
+    # + probe estimate -> fed to the vision prompt as a hint and into the fusion vector.
+    bath_flags = bathroom_detect.detect_flags([r.get("image_path") for r in image_rows])
+    if bath_flags:
+        for i, r in enumerate(image_rows):
+            if i in bath_flags:
+                r["is_bathroom"] = bath_flags[i]
+    listing["bath_model_score"] = bathroom_probe.predict_listing(
+        conn, list(new_vecs.values()), bathroom_probe.bath_centroid(conn))
 
     # Qwen vision + text.
     analysis = vision_llm.analyze_listing(listing, image_rows, bullets)

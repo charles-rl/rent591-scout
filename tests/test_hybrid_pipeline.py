@@ -54,6 +54,8 @@ def env(tmp_path, monkeypatch):
                         lambda path=None: real_connect(path or db_path))
     monkeypatch.setattr(main.vision_llm, "analyze_listing",
                         lambda listing, image_rows, bullets: dict(VISION_OK))
+    monkeypatch.setattr(main.bathroom_detect, "detect_flags",
+                        lambda paths, chunk=None: None)
     monkeypatch.setattr(main.deduplication, "embed_image_rows", lambda rows: {})
     calls = {"proxy_alert": [], "ntfy": []}
     monkeypatch.setattr(main.notifier, "send_proxy_request_alert",

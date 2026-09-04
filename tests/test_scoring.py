@@ -82,7 +82,7 @@ def test_fusion_vector_layout():
     listing = {"price": 12000, "area": 8.0, "floor": "5樓", "shape": "公寓",
                "description": "電費6元/度，需追垃圾車"}
     vec = scoring.fusion_vector(0.7, 3.0, FLAGS_A, ["w"], listing)
-    assert vec.shape == (len(scoring.FEATURE_NAMES),) == (16,)
+    assert vec.shape == (len(scoring.FEATURE_NAMES),) == (17,)
     assert vec[0] == pytest.approx(0.7)                      # dino_visual_score
     assert vec[1] == pytest.approx(0.5)                      # qwen_score = (3-1)/4
     np.testing.assert_allclose(vec[2:8], scoring.flag_vector(FLAGS_A, ["w"]))
@@ -93,7 +93,8 @@ def test_fusion_vector_layout():
     assert vec[12] == 1.0 and vec[13] == 1.0                 # HIGH_ELEC_FEE / MANUAL_TRASH
     assert vec[14] == 0.0 and vec[15] == 0.0                 # NO_PETS / ELEC_EXTRA_HIGH_COST
     empty = scoring.fusion_vector(0.0, None, None, None, None)
-    assert empty.shape == (16,) and empty[1] == pytest.approx(0.5)  # neutral qwen_score
+    assert empty.shape == (17,) and empty[1] == pytest.approx(0.5)  # neutral qwen_score
+    assert empty[16] == 0.0  # bath_model_score absent -> 0, distinct from bad bathroom
 
 
 def test_parse_floor_number():

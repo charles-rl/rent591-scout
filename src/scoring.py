@@ -4,7 +4,8 @@ Phase 1 (<=RATED_THRESHOLD labeled samples): predicted_score = qwen_direct_score
 Phase 2 (>RATED_THRESHOLD): XGBRegressor over the compressed fusion vector -> user_score:
 [dino_visual_score (Layer 1 scalar); qwen_score = (qwen_direct_score-1)/4;
 5 vision flags + 1 has-warnings bit; tabular: log1p price / area_ping / price_per_ping /
-floor_num; HIGH_ELEC_FEE; MANUAL_TRASH; NO_PETS; ELEC_EXTRA_HIGH_COST] (FEATURE_NAMES).
+floor_num; HIGH_ELEC_FEE; MANUAL_TRASH; NO_PETS; ELEC_EXTRA_HIGH_COST;
+bath_model_score (bathroom probe 0-5 / 5, 0 = no bathroom photo) ] (FEATURE_NAMES).
 The raw 768-d DINOv3 vector is
 compressed to dino_visual_score by src/visual_preference.py, never concatenated directly.
 
@@ -84,7 +85,16 @@ FEATURE_NAMES = [
     "has_exterior_window", "has_warnings",
     "log_price", "area_ping", "price_per_ping", "floor_num",
     "HIGH_ELEC_FEE", "MANUAL_TRASH", "NO_PETS", "ELEC_EXTRA_HIGH_COST",
+    "bath_model_score",
 ]
+
+
+def normalize_bath(bath_model_score) -> float:
+    """Bathroom probe score 1-5 -> [0,1]; 0.0 when absent (no bathroom photo)."""
+    s = _num(bath_model_score)
+    if s <= 0.0:
+        return 0.0
+    return float(np.clip(s, 1.0, 5.0) / 5.0)
 
 
 def _num(value) -> float:
@@ -132,11 +142,12 @@ def tabular_vector(listing: dict | None) -> np.ndarray:
 
 def fusion_vector(visual_score: float, qwen_direct_score, flags: dict | None,
                   warnings: list | None, listing: dict | None) -> np.ndarray:
-    """Layer 1 scalar + Layer 2 scalar + vision flags + tabular metadata -> XGB input."""
+    """Layer 1 scalar + Layer 2 scalar + vision flags + tabular + bathroom probe -> XGB input."""
     return np.concatenate([
         np.asarray([visual_score, normalize_qwen(qwen_direct_score)], dtype=np.float32),
         flag_vector(flags, warnings),
         tabular_vector(listing),
+        np.asarray([normalize_bath((listing or {}).get("bath_model_score"))], dtype=np.float32),
     ])
 
 
@@ -153,7 +164,12 @@ def _row_listing(row) -> dict:
 def _row_features(row, visual_score: float) -> np.ndarray:
     flags = _load_json(row["qwen_vision_flags"], {})
     warnings = _load_json(row["qwen_warnings"], [])
-    return fusion_vector(visual_score, row["qwen_direct_score"], flags, warnings, _row_listing(row))
+    listing = _row_listing(row)
+    try:
+        listing["bath_model_score"] = row["bath_model_score"]
+    except (IndexError, KeyError):
+        pass
+    return fusion_vector(visual_score, row["qwen_direct_score"], flags, warnings, listing)
 
 
 def _load_trained_model(conn) -> xgb.XGBRegressor:
@@ -341,6 +357,12 @@ def train_and_save(conn) -> None:
     except Exception:
         logger.exception("Layer-1 probe training failed; falling back to liked centroid features")
     centroid = None if visual_probe else visual_preference.liked_centroid(conn)
+
+    from . import bathroom_probe
+    try:
+        bathroom_probe.train_and_save(conn)
+    except Exception:
+        logger.info("bathroom probe not trained (labels below threshold or no photo labels yet)")
 
     def visual_of(row) -> float:
         vec = _as_embedding(row["dino_embedding"])

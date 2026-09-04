@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS listing_images (
     ordinal INTEGER,
     image_url TEXT, image_path TEXT,
     dino_embedding BLOB,
+    is_bathroom INTEGER,
     UNIQUE(listing_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS idx_listing_images_lid ON listing_images(listing_id);
@@ -92,6 +93,11 @@ _EXTRA_COLUMNS = [
     ("heuristic_score", "REAL"),
     ("qwen_score", "REAL"),
     ("dino_visual_score", "REAL"),
+    ("bath_model_score", "REAL"),
+]
+
+_IMAGE_EXTRA_COLUMNS = [
+    ("is_bathroom", "INTEGER"),
 ]
 
 
@@ -103,6 +109,10 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
             if name == "image_status":
                 _backfill_image_status(conn)
+    img_existing = {r[1] for r in conn.execute("PRAGMA table_info(listing_images)").fetchall()}
+    for name, decl in _IMAGE_EXTRA_COLUMNS:
+        if name not in img_existing:
+            conn.execute(f"ALTER TABLE listing_images ADD COLUMN {name} {decl}")
 
 
 def _backfill_image_status(conn: sqlite3.Connection) -> None:
@@ -168,7 +178,7 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score", "qwen_score",
         "dino_visual_score",
         "dino_embedding", "predicted_score", "score_source", "heuristic_score",
-        "image_status",
+        "image_status", "bath_model_score",
     ]
     placeholders = ", ".join(
         # First insert: never bind a raw NULL — fall back to the stored flag
@@ -206,9 +216,10 @@ def replace_images(conn: sqlite3.Connection, listing_id: str, images: list[dict]
     conn.execute("DELETE FROM listing_images WHERE listing_id=?", (listing_id,))
     for img in images:
         conn.execute(
-            "INSERT OR REPLACE INTO listing_images (listing_id, ordinal, image_url, image_path, dino_embedding) "
-            "VALUES (?,?,?,?,?)",
-            (listing_id, img.get("ordinal"), img.get("image_url"), img.get("image_path"), img.get("dino_embedding")),
+            "INSERT OR REPLACE INTO listing_images (listing_id, ordinal, image_url, image_path, dino_embedding, is_bathroom) "
+            "VALUES (?,?,?,?,?,?)",
+            (listing_id, img.get("ordinal"), img.get("image_url"), img.get("image_path"),
+             img.get("dino_embedding"), img.get("is_bathroom")),
         )
     conn.commit()
 
@@ -233,16 +244,43 @@ def get_rating_count(conn: sqlite3.Connection) -> int:
 def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, user_score, qwen_direct_score, "
-        "price, area, floor, shape, tags, facilities, contain_cost, description FROM listings WHERE user_rated = 1"
+        "price, area, floor, shape, tags, facilities, contain_cost, description, bath_model_score "
+        "FROM listings WHERE user_rated = 1"
     ).fetchall()
 
 
 def get_scoring_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score, "
-        "price, area, floor, shape, tags, facilities, contain_cost, description "
+        "price, area, floor, shape, tags, facilities, contain_cost, description, bath_model_score "
         "FROM listings WHERE IFNULL(user_rated, 0) != 1"
     ).fetchall()
+
+
+def get_bath_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Rated bathroom embeddings: one row per bathroom photo of bathroom-rated listings."""
+    return conn.execute(
+        "SELECT l.listing_id, l.bathroom_score, i.dino_embedding FROM listings l "
+        "JOIN listing_images i ON i.listing_id = l.listing_id "
+        "WHERE l.bathroom_score IS NOT NULL AND IFNULL(i.is_bathroom, 0) = 1 "
+        "AND i.dino_embedding IS NOT NULL"
+    ).fetchall()
+
+
+def get_bath_labeled_embeddings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All DINO-labelled bathroom photos (any listing) for the selection centroid."""
+    return conn.execute(
+        "SELECT dino_embedding FROM listing_images WHERE is_bathroom = 1 AND dino_embedding IS NOT NULL"
+    ).fetchall()
+
+
+def set_bath_image_flags(conn: sqlite3.Connection, listing_id: str, flags: dict[int, int]) -> None:
+    """Persist per-photo bathroom labels {ordinal: 0|1}."""
+    conn.executemany(
+        "UPDATE listing_images SET is_bathroom=? WHERE listing_id=? AND ordinal=?",
+        [(int(v), listing_id, int(k)) for k, v in flags.items()],
+    )
+    conn.commit()
 
 
 def get_liked_embeddings(conn: sqlite3.Connection, min_score: float = 4.0) -> list[sqlite3.Row]:

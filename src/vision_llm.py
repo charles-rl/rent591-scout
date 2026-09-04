@@ -45,6 +45,10 @@ Return ONLY a valid JSON object matching this schema (no prose, no code fences):
 }
 qwen_direct_score is 1.0 to 5.0 based on the user context rules and overall condition.
 If no images are available, set all vision_flags to false and base the score on text only.
+If the user message includes an independent bathroom-quality estimate, treat it as a
+reliable second opinion on the bathroom: a low estimate (<3) is a bathroom defect and
+should lower qwen_direct_score and produce an English bathroom warning; a high estimate
+(>=4) is positive evidence about the bathroom.
 
 All qwen_warnings strings must be written in English (the reviewer does not read Chinese),
 even though the listing text you read is Chinese.
@@ -137,6 +141,12 @@ def build_messages(listing: dict, image_paths: list[str], bullets: str | None) -
         f"Listing facts: {json.dumps(facts, ensure_ascii=False)}\n"
         "Images are attached below (each corresponds to one photo of the property)."
     )
+    bath_score = listing.get("bath_model_score")
+    if bath_score:
+        text += (
+            f"\nIndependent bathroom-quality estimate from a separate photo model: "
+            f"{float(bath_score):.1f}/5. Weigh it per the verification rules above."
+        )
     user_msg: dict = {"role": "user", "content": text}
     images = [b for b in (_image_b64(p) for p in image_paths[:VLM_MAX_IMAGES] if p) if b]
     if images:

@@ -38,8 +38,15 @@ Dedup tests need real image content: DINOv3 CLS collapses on textureless synthet
 - ntfy headers must be ASCII/latin-1: score rendered as `(x.xx/5)` (2 decimals), never `★` (breaks latin-1 encoding).
 - Layer 1 visual preference lives in `src/visual_preference.py`: XGBoost's input is the
   compressed fusion vector `scoring.FEATURE_NAMES` (dino_visual_score + qwen_score + flags +
-  tabular), never the raw 768-d blob; changing the vector width invalidates `models/xgboost_head.json`
+  tabular + bath_model_score), never the raw 768-d blob; changing the vector width invalidates `models/xgboost_head.json`
   and `models/dino_probe.npz` (both auto-retrain).
+- Bathroom layer: `src/bathroom_detect.py` labels bathroom photos via Qwen into
+  `listing_images.is_bathroom`; `src/bathroom_probe.py` ridge-maps pooled bathroom DINO
+  embeddings to the user `bathroom_score` (alpha BATH_PROBE_ALPHA_HEAVY until
+  BATH_PROBE_SOFT_N=30 labels, then softens). Output `listings.bath_model_score` (0.0 = no
+  bathroom photo, distinct from a bad 1/5) feeds the fusion vector AND the vision prompt
+  (bathroom hint in `vision_llm.build_messages`). Seed/retrain: `scripts/backfill_bathrooms.py`
+  (~35 min of Ollama calls; incremental — only labels photos with `is_bathroom IS NULL`).
 - All user-facing text is English: vision prompt demands English warnings; `notifier._summary`/`_en`
   translate the fixed Chinese vocabulary (districts/kind/heuristics/legacy rows). Keep new warning
   strings English or add them to `notifier._WARN_EN`; the consolidate-preferences prompt also forces English bullets.
