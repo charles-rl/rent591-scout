@@ -85,11 +85,12 @@ Scoring begins at a baseline of **100 points**.
 | Feature / Condition | Trigger Criterion | Pipeline Warning Flag | Deduction Points |
 | --- | --- | --- | --- |
 | **Electricity Rate** | Utility rate $> 5.0\text{ NTD/kWh}$ parsed from text | `HIGH_ELEC_FEE` | `-15` |
-| **Pet Allowance** | Text contains `"不可寵"`, `"禁寵"`, or `"嚴禁寵物"` | `NO_PETS` | `-10` |
+| **Pet Allowance** | Positive ban wording (`不可寵`/`禁寵`/`嚴禁寵物` + the 2026-09 additions `不可養寵`/`不開放寵`) or a structured no-pet entry in `facilities` | `NO_PETS` | `-10` |
 | **Walk-Up Floor** | No elevator (shape/facilities) AND floor $\ge 5$ | `HIGH_WALKUP` | `-25` |
 | **Rooftop Structure** | Text indicates `"頂樓加蓋"` / `"頂加"` | `ILLEGAL_ROOFTOP` | `-10` *(Adjusted)* |
 | **Garbage Management** | Text indicates `"追垃圾車"` | `MANUAL_TRASH` | `-10` |
 | **Laundry Setup** | Shared/coin laundry mentioned (`投幣`/`共享洗衣`) | `SHARED_WASHER` | `-5` |
+| **High-Cost Rent + Separate Elec.** | Price > 15,600 NTD/mo (env-overridable) with no evidence electricity is included | `ELEC_EXTRA_HIGH_COST` | `-10` |
 
 $$\text{Final Composite Score} = 100 - \sum \text{Penalty Points}$$
 

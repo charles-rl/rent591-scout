@@ -100,3 +100,15 @@ the bottom is mostly penalty-driven rejects (頂層加蓋 / NO_PETS / HIGH_WALKU
 4. Unit test in `tests/test_scoring.py` (positive + both negative branches);
    update the `test_fusion_vector_layout` width assertion.
 5. Chinese legacy wording variants shown to users: add to `notifier._WARN_EN`.
+
+## Known deferred issues (from the S1/S2 code-review audit)
+
+Open threads left over from the session-1/2 review (`docs/CODE_REVIEW_S1_S2.md`,
+now deleted — this section is where its still-open items live):
+
+- **B16 — `database.replace_images()` AUTOINCREMENT churn:** delete+reinsert of
+  `listing_images` bumps row ids on every re-ingest. Cosmetic; the
+  `UNIQUE(listing_id, ordinal)` contract holds. Consider UPSERT-only updates if it ever matters.
+- **B19 — pet "Yes" heuristic is absence-of-ban:** listings with no pet entry are labelled
+  as allowing pets in `facilities`. Low-risk because the `NO_PETS` penalty fires only on
+  positive ban wording; revisit when an explicit DOM/API evidence check lands.

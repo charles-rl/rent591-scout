@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS listings (
     url               TEXT,
     status            TEXT,
     is_active         BOOLEAN DEFAULT TRUE,
+    is_duplicate      BOOLEAN DEFAULT FALSE,       -- DINOv3 group-cosine dup of a stored listing
     region            TEXT, section TEXT,
     address           TEXT,
     lat REAL, lng REAL,
@@ -69,12 +70,20 @@ CREATE TABLE IF NOT EXISTS listings (
     deposit TEXT, rent_per REAL, rent_per_unit TEXT,
     browse_count INTEGER, refresh_time TEXT,
     tags JSON, contain_cost JSON,
+    social_house BOOLEAN,                          -- 社宅 (social housing) flag
+    facilities JSON,                               -- fridge/washer/AC/pet policy/etc.
     raw_search JSON, raw_metadata JSON, scraper_raw JSON,
     description TEXT,
     image_urls JSON, image_paths JSON,
     qwen_warnings JSON, qwen_vision_flags JSON, qwen_direct_score REAL,
-    dino_embedding BLOB,
-    predicted_score REAL, score_source TEXT,
+    qwen_score REAL,                               -- Layer 2: (qwen_direct_score - 1) / 4
+    dino_visual_score REAL,                        -- Layer 1 scalar 0.0-1.0
+    dino_embedding BLOB,                           -- mean-aggregated float32 (768-dim)
+    predicted_score REAL, score_source TEXT,       -- 'qwen' | 'xgboost'
+    heuristic_score REAL,                          -- Stage-3 penalty engine, baseline 100 (591research.md §4)
+    bath_model_score REAL,                         -- bathroom probe /5.0 (NULL = no labelled bathroom photo)
+    image_status TEXT DEFAULT 'pending',           -- pending → completed | failed | skipped (hybrid relay mode)
+    text_only_notified BOOLEAN DEFAULT FALSE,      -- anti-spam flag for the offline proxy alert
     user_rated BOOLEAN DEFAULT FALSE,
     user_score REAL, bathroom_score REAL, user_comments TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -86,7 +95,8 @@ CREATE TABLE IF NOT EXISTS listing_images (
     listing_id TEXT NOT NULL REFERENCES listings(listing_id),
     ordinal INTEGER,
     image_url TEXT, image_path TEXT,
-    dino_embedding BLOB,
+    dino_embedding BLOB,                           -- per-image float32 (768-dim)
+    is_bathroom INTEGER,                           -- Qwen label: 1 bathroom / 0 not / NULL unlabelled
     UNIQUE(listing_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS idx_listing_images_lid ON listing_images(listing_id);
@@ -95,6 +105,12 @@ CREATE TABLE IF NOT EXISTS dynamic_preferences (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt_bullet_list TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS relay_state (
+    listing_id     TEXT PRIMARY KEY,               -- per-listing payload dedup gate
+    payload_sha256 TEXT,                           -- unchanged payloads skipped on both sides
+    processed_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
 

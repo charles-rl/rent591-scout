@@ -104,13 +104,14 @@ Details & gotchas:
 
 ```bash
 uv venv --python 3.12 .venv
-# Install deps (see docs/BUILD_PLAN.md; CUDA wheels via nexus proxy on this host)
+# CUDA wheels via nexus proxy on this host; torch must be the cu128 build (default cu130 fails to initialize)
 uv pip install --python .venv/bin/python requests Pillow numpy xgboost scikit-learn DrissionPage transformers
 uv pip install --python .venv/bin/python torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=`,
-`X591_KIND=整層住家`, `X591_PRICE_STR=15000_25000`, `NTFY_TOPIC=rent591-scout`,
+Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=` (or a multi-region
+`X591_QUERIES` spec), `X591_KINDS=獨立套房,分租套房` (`X591_KIND` overrides with one kind),
+`X591_PRICE_STR=10000_17000`, `NTFY_TOPIC=rent591-scout`,
 `OLLAMA_BASE_URL=http://localhost:11434`,
 `OLLAMA_MODEL=hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`, `SCORE_THRESHOLD=3.5`.
 

@@ -47,4 +47,4 @@ Source of truth for implementation: `mcp_591/client.py`, `mcp_591/constants.py`,
 ## Behavior notes
 - Rate limiting / anti-bot: undocumented API; README warns against bulk/high-frequency use. On failure `raise_for_status` propagates.
 - `server.py` `_filter_*` drops most fields → **bypass server layer, use `Client591` directly** for zero data loss.
-- Python 3.14 claim in README is advisory; `client.py` + `constants.py` run fine on 3.12 (plain requests/data) → vendored into `src/591_client.py` + `src/591_constants.py`.
+- Python 3.14 claim in README is advisory; `client.py` + `constants.py` run fine on 3.12 (plain requests/data) → vendored as `src/client591.py` + `src/constants591.py`.
