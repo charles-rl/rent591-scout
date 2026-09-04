@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Rent591 incoming ingest every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

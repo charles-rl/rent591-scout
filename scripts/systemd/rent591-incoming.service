@@ -1,0 +1,10 @@
+[Unit]
+Description=Rent591 scout: pull relay payloads and run hybrid ingest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/rent591-scout
+ExecStart=/root/rent591-scout/scripts/run_incoming.sh
+Nice=10

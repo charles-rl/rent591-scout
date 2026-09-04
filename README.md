@@ -132,6 +132,24 @@ python rate.py --id 21103645 --score 4 --bathroom 4 --comment "dry-wet separatio
 
 # manual relay trigger (needs gh / repo token):
 gh workflow run scrape_relay.yml
+
+# backup DB + trained model heads to data/backups/ (keep 10) — run before
+# scripts/purge_noncompliant.py or any destructive DB maintenance:
+python scripts/backup.py
+```
+
+### Local scheduling (host side)
+
+The GitHub relay only produces payloads; the local ingest must run on a cadence
+here. `scripts/run_incoming.sh` does `git pull --ff-only` + `main.py --incoming`
+(pull failures are logged, never block the idempotent ingest). Install the units
+in `scripts/systemd/` for a 30-minute cycle:
+
+```bash
+sudo cp scripts/systemd/rent591-incoming.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rent591-incoming.timer
+systemctl list-timers rent591-incoming.timer
 ```
 
 ## Notes

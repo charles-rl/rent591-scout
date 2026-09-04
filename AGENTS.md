@@ -22,6 +22,8 @@ Hard filters (price 10000–17000, ≥6 ping, kind 2/3 套房) live in `src/inge
 .venv/bin/python main.py --train             # retrain XGBoost head
 .venv/bin/python rate.py --id N --score 4     # rate listing (auto-retrains past RATED_THRESHOLD=20)
 .venv/bin/python -m ruff check .              # lint — clean at HEAD, keep it that way
+.venv/bin/python scripts/backup.py            # snapshot DB+models → data/backups/ (run before purge_noncompliant.py)
+bash scripts/run_incoming.sh                  # git pull + hybrid ingest (what the systemd timer runs)
 gh workflow run scrape_relay.yml              # manual relay trigger
 ```
 
@@ -44,6 +46,9 @@ Dedup tests need real image content: DINOv3 CLS collapses on textureless synthet
 - Proxy traffic uses `verify=False` because devtunnel MITMs TLS with a cert Python rejects.
 - 591 CDN 403s on original photo URLs via the tunnel → fetch `!fit.1000x.water2.jpg` resize variants (`PROXY_IMAGE_SUFFIX`). CDN 502 storms = throttling (backoff, stay `pending`), not a dead proxy.
 - Tests must stay offline: `HF_HUB_OFFLINE=1`, cached DINOv3 weights, fixture replay, mocked Ollama/ntfy/proxy. `conftest.py` inserts repo root into `sys.path`.
+- CI (`ci.yml`) runs ruff + pytest on light deps only (pytest/ruff/numpy/xgboost/Pillow/requests) — never install torch there: real-DINOv3 tests self-skip via module-level `importorskip`/weights check when the gated model or torch is missing.
+- Local cadence is NOT automatic: GitHub cron produces payloads, `scripts/systemd/rent591-incoming.timer` (runs `scripts/run_incoming.sh` = git pull --ff-only + `--incoming`, pull failure tolerated) consumes them. Without the installed timer the DB only grows when someone runs it by hand.
+- Only the DB holds non-re-derivable data (ratings/comments, `dynamic_preferences`, DINOv3 embeddings of soon-delisted photos); `models/` auto-retrains from it. `scripts/backup.py` snapshots DB+heads to `data/backups/` — run before `purge_noncompliant.py` (which deletes with no confirmation).
 - Env config is read at import time in `main.py`/`src/` — see README "Setup" for the full var list (`X591_*`, `PROXY_*`, `NTFY_TOPIC`, `OLLAMA_*`).
 
 ## Deeper docs
