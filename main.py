@@ -215,8 +215,13 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
         listing["listing_id"], predicted, source, len(listing["qwen_warnings"]),
     )
 
-    # Notify.
-    if do_notify:
+    # Notify. Already-rated listings re-surface when the relay repushes them with
+    # changed content (new payload sha); their value is training data, not new matches.
+    already_rated = conn.execute(
+        "SELECT IFNULL(user_rated, 0) FROM listings WHERE listing_id=?",
+        (listing["listing_id"],),
+    ).fetchone()[0] == 1
+    if do_notify and not already_rated:
         notifier.send_ntfy_alert(listing, predicted, SCORE_THRESHOLD, proxy=proxy)
     return "stored"
 

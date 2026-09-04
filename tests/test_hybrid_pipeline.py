@@ -260,6 +260,31 @@ def test_online_local_images_complete_and_notify_via_proxy(env):
     assert env["calls"]["proxy_alert"] == []
 
 
+def test_rated_listing_repush_notified_only_once(env):
+    env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: True)
+    lid = "9010"
+    _write_payload(env["incoming"], lid, ["https://img2.591.com.tw/h/e.jpg"])
+    _write_webp(env["incoming"], lid, 0)
+
+    assert main.run_incoming(env["incoming"], -1, do_notify=None) == 0
+    assert [c[0] for c in env["calls"]["ntfy"]] == [lid]  # first alert
+
+    conn = database.connect(env["db_path"])
+    try:
+        assert database.rate_listing(conn, lid, 4.2, 5.0, "")
+    finally:
+        conn.close()
+
+    # Relay repushes the same listing with changed content (new sha) -> full re-score
+    # but no second alert: rated listings are training data, not new matches.
+    _write_payload(env["incoming"], lid, ["https://img2.591.com.tw/h/e.jpg",
+                                          "https://img2.591.com.tw/h/f.jpg"], sha="sha-B")
+    assert main.run_incoming(env["incoming"], -1, do_notify=None) == 0
+    row = _row(env, lid)
+    assert row["predicted_score"] is not None  # re-scored
+    assert [c[0] for c in env["calls"]["ntfy"]] == [lid]  # still exactly one alert
+
+
 def test_online_drains_pending_then_scores(env, tmp_path):
     env["monkeypatch"].setattr(main.proxy_check, "is_proxy_available", lambda *a, **k: True)
     out_dir = tmp_path / "dl"
