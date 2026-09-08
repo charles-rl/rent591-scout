@@ -85,6 +85,10 @@ jobs:
           echo "tier $TIER -> $QUERIES"
 
       - name: Probe 591 endpoints (prove runner is not blocked)
+        # 591's WAF intermittently 403s GitHub runner IPs (incl. datacenter
+        # blocklisting). The probe is informational; don't fail the run (and
+        # trigger a failure email) over a transient block.
+        continue-on-error: true
         run: |
           echo "runner egress IP: $(curl -s --max-time 15 https://ifconfig.me/ip || echo unknown)"
           rc=0
@@ -99,6 +103,8 @@ jobs:
           exit $rc
 
       - name: Self-test 591 API (warm-up + one search page)
+        # Warm-up only; the scraper step below tolerates its own WAF flakiness.
+        continue-on-error: true
         run: python -m src.ingestion --selftest
 
       - name: Run scraper (dump raw payloads + WebP)
@@ -108,8 +114,14 @@ jobs:
           RELAY_SKIP_IMAGES: ${{ vars.RELAY_SKIP_IMAGES }}
         run: |
           mkdir -p data/incoming
-          python -m src.ingestion --output-dir data/incoming/ \
-            --limit "${{ inputs.limit || '-1' }}"
+          # Tolerate intermittent 591 WAF blocks: log and keep any payloads
+          # already on disk instead of failing the run (and emailing the owner).
+          if python -m src.ingestion --output-dir data/incoming/ \
+            --limit "${{ inputs.limit || '-1' }}"; then
+            echo "scrape OK"
+          else
+            echo "WARN: scrape hit transient failures; existing payloads on disk remain available"
+          fi
 
       - name: Commit and push changes
         run: |

@@ -181,12 +181,20 @@ def send_proxy_request_alert(pending_count: int, proxy: str | None = None) -> bo
     listing images can be fetched. Non-fatal: returns False on failure."""
     if pending_count <= 0:
         return False
-    message = (
-        f"🏠 [591 Monitor] {pending_count} new listings queued for vision processing. "
-        "Connect PC proxy (port 8999) to process images."
-    )
+    if proxy:
+        message = (
+            f"🏠 [591 Monitor] {pending_count} new listings queued for vision processing. "
+            "Connect PC proxy (port 8999) to process images."
+        )
+        title = "PC proxy needed"
+    else:
+        message = (
+            f"🏠 [591 Monitor] {pending_count} new listings queued for vision processing. "
+            "No route to 591 from this host; will retry on the next run."
+        )
+        title = "591 unreachable"
     headers = {
-        "Title": _header_safe("PC proxy needed"),
+        "Title": _header_safe(title),
         "Tags": "house,warning",
         "Priority": "high",
     }

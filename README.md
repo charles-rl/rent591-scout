@@ -115,6 +115,11 @@ Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=` (
 `OLLAMA_BASE_URL=http://localhost:11434`,
 `OLLAMA_MODEL=hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`, `SCORE_THRESHOLD=3.5`.
 
+Hosts that reach 591/ntfy directly (no devtunnel): set `PROXY_URL=` (empty) —
+the pipeline switches to direct-egress mode (probe `PROXY_PROBE_URL` without a
+proxy, fetch images + push ntfy without a tunnel, normal TLS verification).
+`scripts/run_incoming.sh` defaults `PROXY_URL` to empty for such hosts.
+
 Hybrid proxy mode (see above): `PROXY_URL=http://127.0.0.1:8999`,
 `PROXY_PROBE_URL=https://www.591.com.tw/`, `PROXY_SSL_VERIFY=0`,
 `PROXY_IMAGE_SUFFIX=!fit.1000x.water2.jpg`, `PROXY_DOWNLOAD_TIMEOUT=30`,
@@ -151,6 +156,12 @@ sudo cp scripts/systemd/rent591-incoming.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now rent591-incoming.timer
 systemctl list-timers rent591-incoming.timer
+```
+
+Hosts without systemd/cron (e.g. containers) can run the loop fallback instead:
+
+```bash
+nohup bash scripts/run_scheduler.sh >> data/logs/scheduler.log 2>&1 &
 ```
 
 ## Notes

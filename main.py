@@ -357,20 +357,30 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
             if 0 < limit <= counters["ingested"] + counters["failed"]:
                 break
 
-        # ---- Phase 2: proxy check & branching ---------------------------------
-        proxy_live = proxy_check.is_proxy_available(PROXY_URL)
-        effective_notify = bool(proxy_live) if do_notify is None else do_notify
-        logger.info("proxy %s: %s", PROXY_URL, "LIVE" if proxy_live else "OFFLINE")
-        if proxy_live:
-            for lid, rows in image_queue.process_pending_images(conn, PROXY_URL):
+        # ---- Phase 2: connectivity check & branching ---------------------------
+        # PROXY_URL set -> classic PC devtunnel bridge; unset/empty -> direct
+        # egress (host reaches 591/ntfy without a tunnel).
+        proxy_mode = bool(PROXY_URL)
+        if proxy_mode:
+            online = proxy_check.is_proxy_available(PROXY_URL)
+            fetch_route: str | None = PROXY_URL if online else None
+            mode_name = "proxy"
+        else:
+            online = proxy_check.network_available()
+            fetch_route = None
+            mode_name = "direct"
+        effective_notify = bool(online) if do_notify is None else do_notify
+        logger.info("%s egress: %s", mode_name, "LIVE" if online else "OFFLINE")
+        if online:
+            for lid, rows in image_queue.process_pending_images(conn, fetch_route):
                 vision_targets[lid] = rows
         else:
             pending_alerts = database.count_pending_unnotified(conn)
             if pending_alerts:
-                logger.info("%d pending listings -> proxy request alert", pending_alerts)
+                logger.info("%d pending listings -> connectivity request alert", pending_alerts)
                 # Tunnel-first: the probe may fail on 591 while the devtunnel
                 # itself still relays ntfy fine; _post falls back to direct.
-                notifier.send_proxy_request_alert(pending_alerts, proxy=PROXY_URL)
+                notifier.send_proxy_request_alert(pending_alerts, proxy=PROXY_URL if proxy_mode else None)
                 database.mark_text_only_notified(conn)
 
         # Self-heal: images completed earlier whose vision pass never ran.
@@ -391,7 +401,7 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                 try:
                     outcome = finalize_listing(
                         conn, _listing_from_row(row), rows, baseline, bullets,
-                        effective_notify, proxy=PROXY_URL if proxy_live else None,
+                        effective_notify, proxy=fetch_route,
                     )
                     counters[outcome] += 1
                 except Exception:

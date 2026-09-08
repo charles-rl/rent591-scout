@@ -5,6 +5,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/root/rent591-scout
-ExecStart=/root/rent591-scout/scripts/run_incoming.sh
+WorkingDirectory=/home/mses101137/charles/rent591-scout
+ExecStart=/home/mses101137/charles/rent591-scout/scripts/run_incoming.sh
 Nice=10

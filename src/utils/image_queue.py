@@ -52,11 +52,14 @@ _HEADERS = {
 }
 
 
-def _make_session(proxy_url: str) -> requests.Session:
+def _make_session(proxy_url: str | None) -> requests.Session:
+    """proxy_url=None -> direct egress (host reaches the 591 CDN without a tunnel)."""
     session = requests.Session()
     session.headers.update(_HEADERS)
-    session.proxies.update({"http": proxy_url, "https": proxy_url})
-    session.verify = VERIFY_SSL
+    if proxy_url:
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+    # verify=False only for the devtunnel MITM; direct egress uses normal CA checks.
+    session.verify = VERIFY_SSL if proxy_url else True
     # Transient hiccups (429/5xx/connect) retry; 403/404 are persistent and don't.
     session.mount("https://", HTTPAdapter(max_retries=Retry(
         total=2, connect=2, read=2, status=2, backoff_factor=0.5,
@@ -190,17 +193,19 @@ def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[di
     return "completed", rows, None
 
 
-def process_pending_images(conn, proxy_url: str = DEFAULT_PROXY_URL) -> list[tuple[str, list[dict]]]:
-    """Download queued images for active pending listings via the proxy.
+def process_pending_images(conn, proxy_url: str | None = None) -> list[tuple[str, list[dict]]]:
+    """Download queued images for active pending listings (proxy or direct).
 
-    Returns [(listing_id, image_rows)] for listings that reached
-    'completed'/'skipped' in this call, ready for the vision/scoring pass.
+    proxy_url=None -> direct egress. Returns [(listing_id, image_rows)] for
+    listings that reached 'completed'/'skipped' in this call, ready for the
+    vision/scoring pass.
     """
     pending = database.get_pending_image_listings(conn)
     if not pending:
         logger.info("image queue empty: no pending listings")
         return []
-    logger.info("image queue: %d pending listings via %s", len(pending), proxy_url)
+    logger.info("image queue: %d pending listings via %s",
+                len(pending), proxy_url or "direct egress")
     session = _make_session(proxy_url)
     results: list[tuple[str, list[dict]]] = []
     throttle_streak = 0

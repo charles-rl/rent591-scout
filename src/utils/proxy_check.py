@@ -46,3 +46,15 @@ def is_proxy_available(proxy_url: str = DEFAULT_PROXY_URL, timeout: int = 3) -> 
     except requests.RequestException as e:
         logger.info("proxy %s unavailable: %s", proxy_url, e)
         return False
+
+
+def network_available(timeout: int = 5) -> bool:
+    """Direct-egress probe (no proxy). Used when PROXY_URL is unset and the
+    host reaches 591/ntfy directly."""
+    try:
+        # Direct egress: normal CA verification (the devtunnel MITM is not in the path).
+        resp = requests.get(PROBE_URL, headers=_HEADERS, timeout=timeout, verify=True)
+        return resp.status_code == 200
+    except requests.RequestException as e:
+        logger.info("direct egress unavailable: %s", e)
+        return False
