@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Rent591 Google Drive DB-only backup every 30 minutes
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

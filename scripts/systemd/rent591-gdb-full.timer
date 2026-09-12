@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Rent591 Google Drive full backup daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

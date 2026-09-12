@@ -7,3 +7,5 @@ data/*
 models/
 browser_profile/
 .uv/
+credentials.json
+token.json

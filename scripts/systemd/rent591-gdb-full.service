@@ -1,0 +1,10 @@
+[Unit]
+Description=Rent591 scout: Google Drive full backup (images, daily tier)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/mses101137/charles/rent591-scout
+ExecStart=/home/mses101137/charles/rent591-scout/.venv/bin/python -m src.utils.gdrive_backup
+Nice=10
