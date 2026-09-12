@@ -68,10 +68,17 @@ Verification rules (soft constraints — warn, never silently reject):
 """
 
 DEFAULT_BULLETS = (
-    "- Prioritize dry/wet separation in bathroom.\n"
-    "- Flag shower-sink combo faucet setups.\n"
+    "- Priority 1 is the bathroom: prioritize dry/wet separation; flag shower-sink combo "
+    "faucet setups.\n"
     "- For suite-in-shared-house listings, confirm a private bathroom; if unsure, "
     "flag 'Bathroom privacy unconfirmed' for the human reviewer.\n"
+    "- Priority 2 (after the bathroom) is a desk: the unit should have a desk for "
+    "work/study, preferably large enough for two people to sit at side by side (or a "
+    "long desk). If no desk is visible in the photos or text, add the warning 'No desk "
+    "visible'; if a desk exists but is clearly too small for two people, add the warning "
+    "'Desk too small for two people'.\n"
+    "- A couch is not required and a TV is not required: never warn or lower the score "
+    "because they are missing.\n"
     "- Flag no-window, suspected rooftop-addition and shared-bathroom concerns in qwen_warnings."
 )
 

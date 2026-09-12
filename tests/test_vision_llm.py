@@ -136,6 +136,13 @@ def test_build_messages_cap_and_prompt(monkeypatch, tmp_path):
     assert "雙北市" in msgs[1]["content"]
 
 
+def test_desk_priority_bullets_in_default_prompt():
+    prompt = vision_llm.construct_full_prompt(None)
+    assert "Priority 2 (after the bathroom) is a desk" in prompt
+    assert "two people" in prompt
+    assert "A couch is not required and a TV is not required" in prompt
+
+
 def test_downscaled_encode(tmp_path):
     import base64
     import io
