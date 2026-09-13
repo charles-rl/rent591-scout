@@ -21,7 +21,7 @@ Default (no flags) does restore + clean. Use --clean-only to skip restore,
 
 Run ONCE per fresh machine, after cloning, installing deps, and the one-time
 `src.utils.gdrive_backup --auth-only` (which writes token.json). See
-README_BACKUP.md "Fresh machine bootstrap".
+docs/gdrive-backup.md "Fresh machine bootstrap".
 """
 from __future__ import annotations
 

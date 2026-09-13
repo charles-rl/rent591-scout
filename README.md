@@ -144,6 +144,9 @@ gh workflow run scrape_relay.yml
 python scripts/backup.py
 ```
 
+Google Drive backup (db/full tiers, systemd timers, fresh-machine bootstrap):
+see [docs/gdrive-backup.md](docs/gdrive-backup.md).
+
 ### Local scheduling (host side)
 
 The GitHub relay only produces payloads; the local ingest must run on a cadence
