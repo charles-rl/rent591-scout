@@ -32,6 +32,7 @@ from .constants591 import (
     SECTIONS,
     SECTIONS_BY_REGION,
 )
+from .refresh_age import parse_days_on_market
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,7 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None,
         if isinstance(entry, dict) and str(entry.get("key") or "").split("_")[0] == "sex"
     ]
     gender = next((g.strip() for g in gender_values if g.strip()), None)
+    refresh_time = item.get("refresh_time") or (data.get("publish") or {}).get("postTime")
     social_house = item.get("social_house") or (data.get("favData") or {}).get("socialHouse")
     social_house = bool(int(social_house)) if isinstance(social_house, (int, str)) else None
 
@@ -367,7 +369,11 @@ def normalize_listing(raw_search: dict, raw_metadata: dict | None,
         "rent_per": _float_price(item.get("price_per")),
         "rent_per_unit": item.get("price_per_unit") or "元/坪/月",
         "browse_count": item.get("browse_count"),
-        "refresh_time": item.get("refresh_time") or (data.get("publish") or {}).get("postTime"),
+        "refresh_time": refresh_time,
+        # Snapshot the listing age now: 591's refresh_time is relative for fresh
+        # listings, so re-parsing it at scoring time would make predicted_score
+        # drift with the wall clock (unreproducible across runs).
+        "days_on_market": parse_days_on_market(refresh_time),
         "tags": tags,
         "contain_cost": contain,
         "social_house": social_house,

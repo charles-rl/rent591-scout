@@ -37,9 +37,10 @@ If two reasonable people could disagree about it, it is a prompt bullet.
 - Reversed electricity wording "電費1度6元" (listing 21784695) — code:
   `_ELEC_REVERSED_RE` catches the "N度M元" order that `HIGH_ELEC_FEE` previously missed.
 - "5/5 perfect, no comments" (21935557) — nothing to route; pure training signal.
-- `NO_PETS` and `ELEC_EXTRA_HIGH_COST` are now `FEATURE_NAMES` inputs (vector 14 -> 16).
-  `_load_trained_model()` detects the width change and retrains the saved head
-  automatically once enough ratings accumulate.
+- `NO_PETS` and `ELEC_EXTRA_HIGH_COST` are now `FEATURE_NAMES` inputs (the vector has since grown to 18 dims; see `scoring.FEATURE_NAMES`).
+  `_load_trained_model()` detects the mismatch (feature width **or** the head's
+  `feature_names_sha` / probe `train_id`/`alpha` stamps disagree) and retrains the
+  saved head automatically once enough ratings accumulate.
 
 ## Worked example (reviews 21927820 / 21918067 — female-only)
 
@@ -80,9 +81,9 @@ are still worth viewing. One command does the whole loop (the agent can just run
      proxy probe fails; `--no-probe` forces skip.
    - re-scores all unrated listings with the current head (`score_all_unrated`)
      and prints **TOP / MIDDLE / BOTTOM N** (default 5, `--n K`) of what's available,
-     each with location/price/ping/floor/kind + warning flags; `[DUP]` marks DINOv3
-     duplicates. `--retrain` forces a head retrain first (only needed when the
-     width check didn't already fire).
+    each with location/price/ping/floor/kind + warning flags; `[DUP]` marks DINOv3
+    duplicates. `--retrain` forces a head retrain first (only needed when the
+    staleness stamps didn't already fire).
 
 Reply to the user with the three tables as-is. MIDDLE block is the median ±N/2 —
 useful for "what's average" when the top of the list is too good to be true and
@@ -96,7 +97,8 @@ the bottom is mostly penalty-driven rejects (頂層加蓋 / NO_PETS / HIGH_WALKU
    `ingestion.normalize_listing()` and, for retrained rows, `_row_listing()` +
    the SELECTs in `database.get_rated_samples()/get_scoring_rows()`.
 3. Add the flag to `FEATURE_NAMES` + `tabular_vector()` if the user's ratings should
-   train against it (width change auto-retrains the saved head via the width check).
+   train against it (changing the vector invalidates the saved head via the width /
+   `feature_names_sha` stamps, which auto-retrains it).
 4. Unit test in `tests/test_scoring.py` (positive + both negative branches);
    update the `test_fusion_vector_layout` width assertion.
 5. Chinese legacy wording variants shown to users: add to `notifier._WARN_EN`.

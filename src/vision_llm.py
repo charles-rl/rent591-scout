@@ -1,8 +1,9 @@
-"""Qwen 27B (Ollama) vision + text analysis wrapper.
+"""Qwen3.8 Flash Next (Ollama) vision + text analysis wrapper.
 
 Two-tier system prompt: immutable BASE_SYSTEM_PROMPT (structured JSON) + dynamic
 preference bullets. Uses the non-uncensored local model
-hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL via Ollama /api/chat (vision-capable).
+qwen3.8-flash-next-vision (ISTA-DASLab Qwen3.8-Flash-Next GGUF + mmproj vision
+projector, MTP draft) via Ollama /api/chat (vision-capable).
 """
 
 from __future__ import annotations
@@ -20,9 +21,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get(
-    "OLLAMA_MODEL", "hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL"
-)
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.8-flash-next-vision:latest")
 VLM_ATTEMPTS = max(1, int(os.environ.get("VLM_ATTEMPTS", "3")))
 VLM_IMAGE_MAX_SIDE = max(256, int(os.environ.get("VLM_IMAGE_MAX_SIDE", "1024")))
 VLM_MAX_IMAGES = max(1, int(os.environ.get("VLM_MAX_IMAGES", "8")))
@@ -149,7 +148,11 @@ def build_messages(listing: dict, image_paths: list[str], bullets: str | None) -
         "Images are attached below (each corresponds to one photo of the property)."
     )
     bath_score = listing.get("bath_model_score")
-    if bath_score:
+    if bath_score and listing.get("bath_hint_ok"):
+        # Only injected when the bathroom probe demonstrably carries signal
+        # (bathroom_probe.is_degenerate False). A collapsed probe returns ~the
+        # training mean for every listing, so the line would be constant noise on
+        # every call -- and could read as mild positive evidence.
         text += (
             f"\nIndependent bathroom-quality estimate from a separate photo model: "
             f"{float(bath_score):.1f}/5. Weigh it per the verification rules above."

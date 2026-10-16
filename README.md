@@ -2,7 +2,7 @@
 
 Automated, Active Learning-driven rental monitor for Rent591 (`rent.591.com.tw`).
 Combines API ingestion (mcp-591), browser fallback scraping (591scraper), local
-DINOv3 image embeddings for deduplication, a local Qwen 27B vision LLM (Ollama),
+DINOv3 image embeddings for deduplication, a local Qwen3.8 Flash Next vision LLM (Ollama),
 an XGBoost scoring head, and ntfy.sh push notifications.
 
 ## Credits & License
@@ -34,7 +34,7 @@ all third-party components remain under their respective licenses.
 Ingestion (mcp-591 API → 591scraper DOM fallback)
    → WebP images (quality=85)
     → DINOv3 group-cosine dedup (≥0.95, 768-dim ViT-B/16 CLS embeddings from models/dinov3_cache, offline-capable)
-   → Qwen 27B vision + text JSON analysis (Base + Dynamic prompt)
+   → Qwen3.8 Flash Next vision + text JSON analysis (Base + Dynamic prompt)
    → Score (Qwen direct ≤20 ratings | XGBoost >20 ratings)
    → ntfy.sh push if score ≥ 3.5 (via PC devtunnel when online, see hybrid mode)
    → SQLite storage + CLI feedback → dynamic preference prompt retrain
@@ -109,11 +109,31 @@ uv pip install --python .venv/bin/python requests Pillow numpy xgboost scikit-le
 uv pip install --python .venv/bin/python torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
+The vision model `qwen3.8-flash-next-vision` is a local Ollama model created from the
+ISTA-DASLab `Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_S split shards + the repo's
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` vision projector + the MTP draft (one `ollama create`
+Modelfile with three `FROM`s + `DRAFT`). A bare `hf.co/...` pull ships no mmproj and Ollama
+rejects image input with "image input is not supported ... provide the mmproj" — vision was
+verified by color-ID round-trip through `/api/chat`.
+
 Config via env vars (defaults shown): `X591_REGION=台北市`, `X591_SECTION=` (or a multi-region
 `X591_QUERIES` spec), `X591_KINDS=獨立套房,分租套房` (`X591_KIND` overrides with one kind),
 `X591_PRICE_STR=10000_17000`, `NTFY_TOPIC=rent591-scout`,
 `OLLAMA_BASE_URL=http://localhost:11434`,
-`OLLAMA_MODEL=hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`, `SCORE_THRESHOLD=3.5`.
+`OLLAMA_MODEL=qwen3.8-flash-next-vision:latest`, `SCORE_THRESHOLD=3.5`,
+`RATED_THRESHOLD=20`. Stage-1 hard filters (`src/ingestion.py`, applied on both the
+relay and the local side): `HARD_PRICE_MIN=10000`, `HARD_PRICE_MAX=17000`,
+`HARD_MIN_AREA_PING=6.0`, `ENFORCE_HARD_FILTERS=1` (set `0` to disable the drops).
+
+Probe tuning (defaults shown). Both Layer-1 probes are Ridge fits; an alpha that
+dominates the ~1.0 data-eigenvalue scale collapses them onto their bias term, which
+leaves the ranking noise while still producing plausible-looking scores. They must
+stay strictly positive — a zero alpha makes the system singular and LAPACK returns
+garbage rather than raising: `DINO_PROBE_PATH`, `DINO_PROBE_ALPHA=0.01` (band
+0.001-0.1), `BATH_PROBE_PATH`, `BATH_PROBE_ALPHA_HEAVY=0.05`,
+`BATH_PROBE_ALPHA_SOFT=0.01` (band 0.001-0.5, heavy >= soft),
+`BATH_PROBE_SOFT_N=30`, `BATH_PROBE_MIN_RATED=10`, `BATH_SIM_MIN=0.30`,
+`LIKED_MIN_SCORE=4.0`.
 
 Hosts that reach 591/ntfy directly (no devtunnel): set `PROXY_URL=` (empty) —
 the pipeline switches to direct-egress mode (probe `PROXY_PROBE_URL` without a
@@ -191,6 +211,18 @@ nohup bash scripts/run_scheduler.sh >> data/logs/scheduler.log 2>&1 &
   768-dim float32 L2-normalized CLS embeddings, keeping the SQLite BLOB schema unchanged. The raw
   vector feeds Layer 1 (`src/visual_preference.py`), which compresses it to the scalar
   `dino_visual_score` (liked-centroid cosine ≤20 ratings, Ridge linear probe >20) for the XGBoost fusion.
+  The head is trained on *out-of-fold* Layer-1 values (leave-one-out refits), because the probe is
+  fit on the very rows it labels and its in-sample output is otherwise a near-perfect predictor of
+  the target — which collapses XGBoost onto a single split.
+- **Bathroom layer:** `src/bathroom_detect.py` runs a cheap JSON-only Qwen pass per photo chunk →
+  `listing_images.is_bathroom` (1 bathroom / 0 not / NULL never classified — a failed chunk or an
+  unreadable photo leaves positions NULL; the classifier *raises* on all-dead chunks and malformed
+  replies, so "no bathroom" is only ever a real verdict). `src/bathroom_probe.py` ridge-maps the
+  pooled embeddings of the Qwen-confirmed photos to `listings.bath_model_score` (1-5; 0.0 =
+  confirmed-absent or no evidence) — the 18th fusion-vector feature, and a gated hint in the
+  vision prompt (withheld while `bathroom_probe.is_degenerate`). Qwen's labels are authoritative
+  whenever every embedded photo carries one; otherwise the centroid fallback stays eligible.
+  Seed/repair without LLM calls: `scripts/backfill_bathrooms.py --rescore` / `--clear-unsupported`.
 - Verified: full pipeline passes end-to-end in fixtures mode on GPU (DINOv3 + Qwen
   vision + cold-start/XGBoost scoring); ntfy payload validated via local capture
   (Title header is ASCII `(x.xx/5)` — a `★` in the header breaks latin-1 encoding).

@@ -165,19 +165,53 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
         listing["is_duplicate"] = True
         listing["dino_embedding"] = deduplication.aggregate_embedding(list(new_vecs.values()))
         database.upsert_listing(conn, listing)
-        database.replace_images(conn, listing["listing_id"], image_rows)
+        # preserve_labels: this branch returns before the bath layer, so image_rows
+        # carries no is_bathroom. Wiping to NULL here re-created the stale-score /
+        # unlabelled-photo pattern on every duplicate re-push.
+        database.replace_images(conn, listing["listing_id"], image_rows, preserve_labels=True)
         baseline[listing["listing_id"]] = list(new_vecs.values())
         return "duplicate"
 
     # Bathroom layer: Qwen photo labels (persisted for probe retraining, fail-soft)
     # + probe estimate -> fed to the vision prompt as a hint and into the fusion vector.
     bath_flags = bathroom_detect.detect_flags([r.get("image_path") for r in image_rows])
-    if bath_flags:
+    if bath_flags is not None:
         for i, r in enumerate(image_rows):
             if i in bath_flags:
                 r["is_bathroom"] = bath_flags[i]
+    # Align each embedding with its own photo's label: embed_image_rows() is keyed
+    # by ordinal and silently omits rows whose embedding failed, so position i in
+    # new_vecs.values() is NOT position i in image_rows. Feeding unaligned indices
+    # would let a bedroom's embedding be scored as a bathroom.
+    photo_vecs: list[np.ndarray] = []
+    confirmed_bath: list[int] = []
+    for r in image_rows:
+        vec = new_vecs.get(r["ordinal"])
+        if vec is None:
+            continue
+        if r.get("is_bathroom") == 1:
+            confirmed_bath.append(len(photo_vecs))
+        photo_vecs.append(vec)
+    # detect_flags() returns None only when EVERY chunk failed. When it ran but a chunk
+    # timed out, that chunk's positions are simply absent from the dict: they are
+    # unknown, not "no bathroom". Handing photo_indices=[] in that case would exclude
+    # those photos AND disable the centroid fallback, forcing a genuine bathroom in a
+    # timed-out chunk to score 0.0. So the centroid is only suppressed when every
+    # photo that has an embedding actually carries a verdict. Coverage is decided
+    # from the labels themselves, NOT from whether detection ran this round:
+    # scripts/backfill_vision.py re-finalizes with detect_flags stubbed to None while
+    # feeding the STORED labels on the rows, and those verdicts must stay
+    # authoritative -- otherwise every backfill pass silently downgrades Qwen's
+    # labels to centroid estimates.
+    embedded_rows = [r for r in image_rows if r["ordinal"] in new_vecs]
+    bath_covered = bool(embedded_rows) and all(
+        r.get("is_bathroom") is not None for r in embedded_rows)
     listing["bath_model_score"] = bathroom_probe.predict_listing(
-        conn, list(new_vecs.values()), bathroom_probe.bath_centroid(conn))
+        conn, photo_vecs, bathroom_probe.bath_centroid(conn),
+        photo_indices=confirmed_bath if bath_covered else None)
+    # Only surface the estimate to the vision prompt when the probe carries real
+    # signal; a collapsed probe would just add a constant line of noise.
+    listing["bath_hint_ok"] = not bathroom_probe.is_degenerate(conn)
 
     # Qwen vision + text.
     analysis = vision_llm.analyze_listing(listing, image_rows, bullets)
@@ -191,7 +225,7 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
     listing["qwen_direct_score"] = analysis["qwen_direct_score"]
 
     # Scoring. Layer 1 compresses the aggregate embedding to dino_visual_score;
-    # Layer 3 fuses [dino_visual_score, qwen_score, flags, tabular] for XGBoost.
+    # Layer 3 fuses [dino_visual_score, qwen_score, flags, tabular, log_days_on_market, bath_model_score] for XGBoost.
     agg = deduplication.aggregate_embedding(list(new_vecs.values()))
     listing["dino_embedding"] = agg
     dino_vec = np.frombuffer(agg, dtype=np.float32) if agg else np.zeros(768, dtype=np.float32)
@@ -208,7 +242,9 @@ def finalize_listing(conn, listing: dict, image_rows: list[dict], baseline: dict
     # stale flag if this listing's images changed since a previous duplicate run.
     listing["is_duplicate"] = False
     database.upsert_listing(conn, listing)
-    database.replace_images(conn, listing["listing_id"], image_rows)
+    # Labels for photos detection never saw (a failed chunk, or bath_flags=None) stay
+    # NULL on the new rows; preserve_labels keeps the previous verdict for those ordinals.
+    database.replace_images(conn, listing["listing_id"], image_rows, preserve_labels=True)
 
     logger.info(
         "%s score=%.2f (%s) warnings=%d",
@@ -347,7 +383,11 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                     database.upsert_listing(conn, listing)
                     database.reset_text_only_notified(conn, lid)
                     if listing["image_status"] == "completed":
-                        database.replace_images(conn, lid, rows)
+                        # preserve_labels: these rows carry no is_bathroom key yet
+                        # (detection runs later in finalize_listing). Writing them
+                        # unguarded NULLs out existing verdicts on every relay
+                        # re-push -- the live source of the unlabelled-photo pile.
+                        database.replace_images(conn, lid, rows, preserve_labels=True)
                 database.mark_relay_processed(conn, lid, sha)
                 counters["ingested"] += 1
             except Exception:
@@ -407,6 +447,13 @@ def run_incoming(incoming_dir: Path, limit: int, do_notify: bool | None) -> int:
                 except Exception:
                     logger.exception("vision pass failed for %s", lid)
                     counters["failed"] += 1
+
+            # The 30-min cadence scores through predict_score, which never calls
+            # _warn_if_collapsed -- so without this the guard would only ever run on
+            # --train / rank_unrated.py and a collapsed probe could persist for days.
+            # Read-only: predicts without persisting, so it cannot shift stored scores.
+            if counters.get("stored") or counters.get("duplicate"):
+                scoring.check_score_health(conn)
     except Exception:
         logger.exception("fatal incoming pipeline error")
         return 1

@@ -7,8 +7,11 @@ docs/data-maxification.md and IMPLEMENTATION_OUTLINE.md §3.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -42,6 +45,7 @@ CREATE TABLE IF NOT EXISTS listings (
     text_only_notified BOOLEAN DEFAULT FALSE,
     user_rated BOOLEAN DEFAULT FALSE,
     user_score REAL, bathroom_score REAL, user_comments TEXT,
+    days_on_market REAL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -94,6 +98,7 @@ _EXTRA_COLUMNS = [
     ("qwen_score", "REAL"),
     ("dino_visual_score", "REAL"),
     ("bath_model_score", "REAL"),
+    ("days_on_market", "REAL"),
 ]
 
 _IMAGE_EXTRA_COLUMNS = [
@@ -102,17 +107,30 @@ _IMAGE_EXTRA_COLUMNS = [
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """Idempotently add columns introduced after the initial schema (migration)."""
+    """Idempotently add columns introduced after the initial schema (migration).
+
+    Fail-soft per statement (house style): one broken migration must not make
+    `connect()` unusable -- the pipeline fails later and loudly on the missing
+    column instead of dying at open time with no context.
+    """
     existing = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
     for name, decl in _EXTRA_COLUMNS:
         if name not in existing:
-            conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
-            if name == "image_status":
-                _backfill_image_status(conn)
+            try:
+                conn.execute(f"ALTER TABLE listings ADD COLUMN {name} {decl}")
+                if name == "image_status":
+                    _backfill_image_status(conn)
+                elif name == "days_on_market":
+                    _backfill_days_on_market(conn)
+            except Exception:
+                logger.exception("migration failed for listings.%s", name)
     img_existing = {r[1] for r in conn.execute("PRAGMA table_info(listing_images)").fetchall()}
     for name, decl in _IMAGE_EXTRA_COLUMNS:
         if name not in img_existing:
-            conn.execute(f"ALTER TABLE listing_images ADD COLUMN {name} {decl}")
+            try:
+                conn.execute(f"ALTER TABLE listing_images ADD COLUMN {name} {decl}")
+            except Exception:
+                logger.exception("migration failed for listing_images.%s", name)
 
 
 def _backfill_image_status(conn: sqlite3.Connection) -> None:
@@ -161,6 +179,36 @@ def _requeue_missing_image_files(conn: sqlite3.Connection) -> None:
             )
 
 
+def _backfill_days_on_market(conn: sqlite3.Connection) -> None:
+    """Snapshot listing age from refresh_time for pre-existing rows.
+
+    days_on_market is derived once, here, so scoring never re-parses time-relative
+    591 text (which would make predicted_score drift with the wall clock). The
+    snapshot uses the age as known today; for relative strings like '1天前' that
+    over-estimates the true ingest age slightly, which is accepted -- the value is
+    then frozen and reproducible. Unparseable/NULL refresh_time stays NULL, which
+    scoring encodes as the -1.0 sentinel.
+    """
+    from .refresh_age import parse_days_on_market  # stdlib-only; keeps connect() light
+
+    rows = conn.execute(
+        "SELECT listing_id, refresh_time FROM listings WHERE days_on_market IS NULL"
+    ).fetchall()
+    updates = []
+    for listing_id, refresh_time in rows:
+        try:
+            dom = parse_days_on_market(refresh_time)
+        except Exception:
+            logger.exception("days_on_market backfill failed for %s", listing_id)
+            continue
+        if dom is not None:
+            updates.append((float(dom), listing_id))
+    if updates:
+        conn.executemany("UPDATE listings SET days_on_market=? WHERE listing_id=?", updates)
+        conn.commit()
+        logger.info("backfilled days_on_market for %d/%d listings", len(updates), len(rows))
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False) if value is not None else None
 
@@ -178,7 +226,7 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
         "qwen_warnings", "qwen_vision_flags", "qwen_direct_score", "qwen_score",
         "dino_visual_score",
         "dino_embedding", "predicted_score", "score_source", "heuristic_score",
-        "image_status", "bath_model_score",
+        "image_status", "bath_model_score", "days_on_market",
     ]
     placeholders = ", ".join(
         # First insert: never bind a raw NULL — fall back to the stored flag
@@ -212,27 +260,63 @@ def upsert_listing(conn: sqlite3.Connection, listing: dict) -> None:
     conn.commit()
 
 
-def replace_images(conn: sqlite3.Connection, listing_id: str, images: list[dict]) -> None:
+def replace_images(conn: sqlite3.Connection, listing_id: str, images: list[dict],
+                   preserve_labels: bool = False) -> None:
+    """Replace a listing's image rows.
+
+    `is_bathroom` is a Qwen detection result costing one vision call per photo, and
+    `NULL` means "not labelled yet" -- not "there is no bathroom". This function is
+    called on every image-queue drain (`src/utils/image_queue.py`), on the relay
+    ingest path and on the duplicate short-circuit in `main.py`, all of which pass
+    rows that carry no `is_bathroom` key. Writing those as NULL unconditionally
+    destroyed previously-good labels on every re-finalize, which is the live source
+    of the NULL-label pile-up. With `preserve_labels=True` an existing label
+    survives unless the caller explicitly supplies a new one.
+
+    Preservation matches by `image_url` when the stored rows carry unique URLs --
+    ordinal-only matching re-attached a verdict to a DIFFERENT photo whenever the
+    relay re-push inserted/removed/reordered one. Unknown (new) URLs stay
+    unlabelled; only when the stored rows have no usable URL identity do we fall
+    back to ordinal matching (e.g. test fixtures with placeholder URLs).
+    """
+    prior_by_ord: dict = {}
+    prior_by_url: dict | None = None
+    if preserve_labels:
+        stored = conn.execute(
+            "SELECT ordinal, image_url, is_bathroom FROM listing_images WHERE listing_id=?",
+            (listing_id,)).fetchall()
+        prior_by_ord = {int(r[0]): r[2] for r in stored}
+        urls = [r[1] for r in stored]
+        if urls and all(urls) and len(set(urls)) == len(urls):
+            prior_by_url = {r[1]: r[2] for r in stored}
     conn.execute("DELETE FROM listing_images WHERE listing_id=?", (listing_id,))
     for img in images:
+        label = img.get("is_bathroom")
+        if label is None:
+            if prior_by_url is not None:
+                label = prior_by_url.get(img.get("image_url"))
+            else:
+                label = prior_by_ord.get(img.get("ordinal"))
         conn.execute(
             "INSERT OR REPLACE INTO listing_images (listing_id, ordinal, image_url, image_path, dino_embedding, is_bathroom) "
             "VALUES (?,?,?,?,?,?)",
             (listing_id, img.get("ordinal"), img.get("image_url"), img.get("image_path"),
-             img.get("dino_embedding"), img.get("is_bathroom")),
+             img.get("dino_embedding"), label),
         )
     conn.commit()
 
 
 def get_all_images(conn: sqlite3.Connection) -> dict[str, list[dict]]:
     rows = conn.execute(
-        "SELECT listing_id, ordinal, image_url, image_path, dino_embedding FROM listing_images ORDER BY ordinal"
+        "SELECT listing_id, ordinal, image_url, image_path, dino_embedding, is_bathroom "
+        "FROM listing_images ORDER BY ordinal"
     ).fetchall()
     out: dict[str, list[dict]] = {}
     for r in rows:
         out.setdefault(r["listing_id"], []).append(
             {"ordinal": r["ordinal"], "image_url": r["image_url"],
-             "image_path": r["image_path"], "dino_embedding": r["dino_embedding"]}
+             "image_path": r["image_path"], "dino_embedding": r["dino_embedding"],
+             "is_bathroom": r["is_bathroom"]}
         )
     return out
 
@@ -244,7 +328,7 @@ def get_rating_count(conn: sqlite3.Connection) -> int:
 def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, user_score, qwen_direct_score, "
-        "price, area, floor, shape, tags, facilities, contain_cost, description, bath_model_score "
+        "price, area, floor, shape, tags, facilities, contain_cost, description, days_on_market, bath_model_score "
         "FROM listings WHERE user_rated = 1"
     ).fetchall()
 
@@ -252,7 +336,7 @@ def get_rated_samples(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def get_scoring_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT listing_id, dino_embedding, qwen_vision_flags, qwen_warnings, qwen_direct_score, "
-        "price, area, floor, shape, tags, facilities, contain_cost, description, bath_model_score "
+        "price, area, floor, shape, tags, facilities, contain_cost, description, days_on_market, bath_model_score "
         "FROM listings WHERE IFNULL(user_rated, 0) != 1"
     ).fetchall()
 

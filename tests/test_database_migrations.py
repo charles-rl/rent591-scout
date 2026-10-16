@@ -62,6 +62,14 @@ def old_db(tmp_path):
     conn.execute("INSERT INTO listings (listing_id, predicted_score, image_urls, image_paths) "
                  "VALUES ('real-photos', 4.0, '[\"https://cdn/y.jpg\"]', ?)",
                  (f'["{real}"]',))
+    # refresh_time sources for the days_on_market backfill snapshot. These rows
+    # carry predicted_score + NULL image_paths so the image_status backfill
+    # classifies them 'skipped' (already processed), keeping the status
+    # assertion in test_migration_backfills_terminal_statuses focused on images.
+    for lid, rt in (("fresh-rel", "此房屋在3天前發佈"), ("just-now", "此房屋在剛剛發佈"),
+                    ("no-refresh", None), ("garbage-refresh", "not-a-date")):
+        conn.execute("INSERT INTO listings (listing_id, predicted_score, image_paths, refresh_time) "
+                     "VALUES (?, 3.5, NULL, ?)", (lid, rt))
     conn.commit()
     conn.close()
     return db_path
@@ -81,6 +89,11 @@ def test_migration_backfills_terminal_statuses(old_db):
             "dead-no-images": "skipped",     # inactive, nothing left to fetch
             "ghost-photos": "pending",       # requeued: 'completed' files are missing
             "real-photos": "completed",      # real >4KB photo on disk
+            # days_on_market fixtures: already scored, no photos -> terminal
+            "fresh-rel": "skipped",
+            "just-now": "skipped",
+            "no-refresh": "skipped",
+            "garbage-refresh": "skipped",
         }
     finally:
         conn.close()
@@ -90,3 +103,42 @@ def test_migration_idempotent_on_reconnect(old_db):
     first = _statuses(database.connect(old_db))
     again = _statuses(database.connect(old_db))
     assert again == first
+
+
+def _doms(conn):
+    return dict(conn.execute("SELECT listing_id, days_on_market FROM listings").fetchall())
+
+
+def test_migration_backfills_days_on_market_snapshot(old_db):
+    """Pre-migration rows get their age snapshotted from refresh_time.
+
+    Relative 591 text is only meaningful at parse time, so the migration must
+    freeze it into days_on_market rather than leaving the pipeline to re-derive a
+    drifting value at every scoring pass.
+    """
+    conn = database.connect(old_db)
+    try:
+        doms = _doms(conn)
+        assert doms["fresh-rel"] == 3.0            # '3天前' -> 3 days
+        assert doms["just-now"] == 0.0             # '剛剛' -> brand new, not NULL
+        assert doms["no-refresh"] is None          # unparseable stays NULL
+        assert doms["garbage-refresh"] is None     # unparseable stays NULL
+    finally:
+        conn.close()
+
+
+def test_days_on_market_backfill_idempotent(old_db):
+    conn = database.connect(old_db)
+    try:
+        first = _doms(conn)
+        # A manual edit must survive reconnect: the backfill only runs on the
+        # migration itself, not on every connect().
+        conn.execute("UPDATE listings SET days_on_market=99.0 WHERE listing_id='fresh-rel'")
+        conn.commit()
+        conn.close()
+        again = _doms(database.connect(old_db))
+        assert again["fresh-rel"] == 99.0
+        assert {k: v for k, v in again.items() if k != "fresh-rel"} == \
+               {k: v for k, v in first.items() if k != "fresh-rel"}
+    finally:
+        conn.close()

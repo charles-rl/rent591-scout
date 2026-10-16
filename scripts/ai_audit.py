@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import main
-from src import ingestion, scoring, vision_llm
+from src import bathroom_probe, ingestion, scoring, vision_llm, visual_preference
 
 CONCERNS = {"window-less (無窗)": ("無窗", "採光", "exterior window"),
             "private bath (獨立衛浴)": ("獨立衛浴", "衛浴獨立"),
@@ -66,6 +66,12 @@ def main_() -> int:
         ("SCORE_THRESHOLD", main.SCORE_THRESHOLD, "env", "notify cutoff (1-5 scale)"),
         ("DEDUP_THRESHOLD", main.DEDUP_THRESHOLD, "env", "DINOv3 group-cosine duplicate cutoff"),
         ("RATED_THRESHOLD", scoring.RATED_THRESHOLD, "env", "XGBoost takeover point"),
+        ("DINO_PROBE_ALPHA", visual_preference.PROBE_ALPHA, "env", "Layer-1 Ridge (band 0.001-0.1)"),
+        ("BATH_PROBE_ALPHA_HEAVY", bathroom_probe.ALPHA_HEAVY, "env", "bath Ridge, n<=SOFT_N (0.001-0.5)"),
+        ("BATH_PROBE_ALPHA_SOFT", bathroom_probe.ALPHA_SOFT, "env", "bath Ridge, n>SOFT_N"),
+        ("BATH_PROBE_SOFT_N", bathroom_probe.SOFT_N, "env", "labels before softening"),
+        ("BATH_PROBE_MIN_RATED", bathroom_probe.MIN_BATH_RATED, "env", "min labels before a bath probe"),
+        ("LIKED_MIN_SCORE", visual_preference.LIKED_MIN_SCORE, "env", "centroid 'liked' cutoff"),
         ("VLM_ATTEMPTS", vision_llm.VLM_ATTEMPTS, "env", "JSON-retry attempts per VLM call"),
         ("VLM_MAX_IMAGES", vision_llm.VLM_MAX_IMAGES, "env", "photos per VLM call"),
         ("VLM_IMAGE_MAX_SIDE", vision_llm.VLM_IMAGE_MAX_SIDE, "env", "downscale cap (px)"),
@@ -90,7 +96,9 @@ def main_() -> int:
         nfeat = trees[0].get("num_feature", "?") if trees else "?"
         print(f"  model={MODEL_PATH.name} trees={len(trees)} features={nfeat} "
               f"degenerate={'YES (constant base_score; needs retrain after >20 ratings)' if degenerate else 'no'}")
-        print("  note: feature vector is fixed at 768 DINO dims + 5 flags + 1 warning bit = 774.")
+        print(f"  note: fusion vector is {len(scoring.FEATURE_NAMES)} compressed features "
+              f"({', '.join(scoring.FEATURE_NAMES)}); the raw 768-d DINOv3 blob is never "
+              f"concatenated directly.")
     else:
         print("  models/xgboost_head.json missing -> trains from rated rows on first use")
 
@@ -104,6 +112,10 @@ def main_() -> int:
         "3. XGBoost head is degenerate until >RATED_THRESHOLD rated rows accumulate;",
         "   after first retrain (rate.py auto-triggers), consider raising",
         "   SCORE_THRESHOLD to 4.0 so rooftop/window warnings must survive scoring.",
+        "   Degeneracy has a second, subtler cause: an over-large Layer-1 alpha collapses",
+        "   the probe onto its bias term, which looks like a working head that ranks on",
+        "   noise. `scoring._warn_if_collapsed` names the offending columns; check the",
+        "   probe alphas in [4] before blaming the row count.",
         "4. DEDUP_THRESHOLD 0.95 is conservative; if re-photos of the same unit slip",
         "   through, lower to ~0.92. Vision confidence is boolean-only (no per-flag",
         "   confidence value exists in the schema) — a `bathroom_confidence` float",

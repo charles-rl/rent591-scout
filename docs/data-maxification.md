@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS listings (
     layout TEXT, area REAL, floor TEXT, shape TEXT, kind_name TEXT,
     deposit TEXT, rent_per REAL, rent_per_unit TEXT,
     browse_count INTEGER, refresh_time TEXT,
+    days_on_market REAL,                           -- age (days) snapshot at ingest (parse_days_on_market); NULL = never parsed
     tags JSON, contain_cost JSON,
     social_house BOOLEAN,                          -- 社宅 (social housing) flag
     facilities JSON,                               -- fridge/washer/AC/pet policy/etc.
@@ -81,7 +82,7 @@ CREATE TABLE IF NOT EXISTS listings (
     dino_embedding BLOB,                           -- mean-aggregated float32 (768-dim)
     predicted_score REAL, score_source TEXT,       -- 'qwen' | 'xgboost'
     heuristic_score REAL,                          -- Stage-3 penalty engine, baseline 100 (591research.md §4)
-    bath_model_score REAL,                         -- bathroom probe /5.0 (NULL = no labelled bathroom photo)
+    bath_model_score REAL,                         -- bathroom probe 1-5; 0.0 = confirmed-absent OR no evidence (NULL only pre-scoring)
     image_status TEXT DEFAULT 'pending',           -- pending → completed | failed | skipped (hybrid relay mode)
     text_only_notified BOOLEAN DEFAULT FALSE,      -- anti-spam flag for the offline proxy alert
     user_rated BOOLEAN DEFAULT FALSE,

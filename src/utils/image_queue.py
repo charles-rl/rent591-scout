@@ -187,7 +187,10 @@ def _process_listing(conn, row, session: requests.Session) -> tuple[str, list[di
 
     for r in rows:
         r.setdefault("dino_embedding", None)
-    database.replace_images(conn, lid, rows)
+    # preserve_labels: this runs on every drain, BEFORE any bathroom detection, and
+    # these rows carry no is_bathroom -- writing them as NULL wiped every previously
+    # detected label on every cycle.
+    database.replace_images(conn, lid, rows, preserve_labels=True)
     database.set_image_status(conn, lid, "completed", image_paths=[r["image_path"] for r in rows])
     logger.info("%s: %d/%d images downloaded -> image_status=completed", lid, ok_count, len(urls))
     return "completed", rows, None

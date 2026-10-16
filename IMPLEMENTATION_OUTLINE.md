@@ -45,7 +45,7 @@ This system integrates two open-source scraping components:
                                        │ (If unique & active)
                                        ▼
                      ┌───────────────────────────────────┐
-                     │ 3. Qwen 27B Vision & Text Engine  │
+                     │ 3. Qwen3.8 Flash Next Vision & Text Engine  │
                      │    - Base System Prompt (JSON)    │
                      │    - Dynamic Preference Prompt    │
                      │    - Generates Flags & Red Flags  │
@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS listings (
     layout TEXT, area REAL, floor TEXT, shape TEXT, kind_name TEXT,
     deposit TEXT, rent_per REAL, rent_per_unit TEXT,
     browse_count INTEGER, refresh_time TEXT,
+    days_on_market REAL,                    -- age (days) snapshot at ingest (parse_days_on_market); NULL = never parsed
     tags JSON, contain_cost JSON,
     social_house BOOLEAN,                   -- 社宅 (social housing) flag
     facilities JSON,                        -- fridge/washer/AC/pet policy/etc.
@@ -142,7 +143,7 @@ CREATE TABLE IF NOT EXISTS listings (
     predicted_score REAL,
     score_source TEXT,                      -- 'qwen' | 'xgboost'
     heuristic_score REAL,                   -- Stage-3 penalty engine, baseline 100 (591research.md §4)
-    bath_model_score REAL,                  -- bathroom probe /5.0 (NULL = no labelled bathroom photo)
+    bath_model_score REAL,                  -- bathroom probe 1-5; 0.0 = confirmed-absent OR no evidence (NULL only pre-scoring)
 
     -- Hybrid relay mode (README "Hybrid PC-proxy mode")
     image_status TEXT DEFAULT 'pending',    -- pending → completed | failed | skipped
@@ -336,7 +337,7 @@ def check_group_duplication(new_image_vectors, stored_listings_vectors_dict, thr
 
 ---
 
-### Component 3: Vision & Text Parsing (Qwen 27B)
+### Component 3: Vision & Text Parsing (Qwen3.8 Flash Next)
 
 The LLM call uses a **Two-Tier System Prompt**: an immutable Base System Prompt (enforcing structured JSON) and a Dynamic Preference Prompt (updated from user feedback).
 
@@ -399,7 +400,7 @@ def construct_full_prompt(sqlite_conn):
 * **Cold-Start Phase ($\le 20$ rated):** `predicted_score = qwen_direct_score`
   (`score_source='qwen'`); Layer 1 still computes and stores `dino_visual_score` via centroid.
 * **Supervised Phase ($> 20$ rated):** `XGBRegressor(max_depth=3, n_estimators=50, lr=0.1)`
-  trained on `user_score` over the compressed fusion vector, persisted to
+  trained on `user_score` over the compressed fusion vector (Layer 1 cross-fitted; see below), persisted to
   `models/xgboost_head.json`, prediction clamped to [1.0, 5.0]:
 
 ```text
@@ -407,7 +408,22 @@ X = [dino_visual_score, qwen_score,
      has_bathroom_img, shower_sink_combo, drainage_risk, has_kitchen_sink,
      has_exterior_window, has_warnings,
      log1p(price), area_ping, price_per_ping, floor_num,
-     HIGH_ELEC_FEE, MANUAL_TRASH]              # scoring.FEATURE_NAMES (14 dims)
+     HIGH_ELEC_FEE, MANUAL_TRASH, NO_PETS, ELEC_EXTRA_HIGH_COST,
+     log_days_on_market, bath_model_score]      # scoring.FEATURE_NAMES (18 dims)
+
+Layer-1 (`dino_visual_score`) is fed to this matrix as an OUT-OF-FOLD value
+(`visual_preference.cross_fitted_values`): the Ridge probe is fit on exactly the
+rows the head trains on, so its in-sample output is a near-perfect predictor of
+user_score. Training on it hands XGBoost 100% of its gain from a single split and
+starves the other 17 features. `log_days_on_market` is a snapshot taken at ingest
+(`ingestion.normalize_listing` -> `parse_days_on_market` in stdlib-only
+`src/refresh_age.py`); -1.0 is the "never parsed" sentinel and is distinct from
+0.0 (brand new). `bath_model_score` enters via `normalize_bath` (1-5 -> /5); 0.0
+covers both "detection confirmed no bathroom" and "no evidence at all".
+The head and the Layer-1 probe are stamped with each other's identity
+(`probe_train_id`/`feature_names_sha`/`basis` in the head,
+`alpha`/`n_trained`/`train_id` in `dino_probe.npz`); `_head_is_stale` retrains on
+any disagreement, so a restored pair from different generations cannot be served.
 ```
 
 The raw 768-dim embedding is never concatenated into the XGBoost vector; every stage
@@ -509,19 +525,23 @@ When creating the repository, follow this folder layout:
 ├── data/
 │   └── apartments.db            # SQLite primary database
 ├── models/
-│   ├── xgboost_head.json        # Saved XGBoost weights
-│   ├── dino_probe.npz           # Layer-1 Ridge probe weights (768-d -> dino_visual_score)
+│   ├── xgboost_head.json        # Saved XGBoost weights (stamped: feature_names_sha, basis, probe_train_id)
+│   ├── dino_probe.npz           # Layer-1 Ridge probe weights (768-d -> dino_visual_score; stamped: alpha/n_trained/train_id)
+│   ├── bathroom_probe.npz       # bathroom Ridge weights (768-d -> bath_model_score)
 │   └── dinov3_cache/            # Local DINOv3 model weights (offline)
 │       └── facebook_dinov3-vit-base/  # config.json + model.safetensors (ViT-B/16)
 ├── src/
 │   ├── __init__.py
-│   ├── database.py              # SQLite connection, DDL, upserts
+│   ├── database.py              # SQLite connection, DDL, upserts, migrations
 │   ├── client591.py            # Vendored mcp-591 Client591 (MIT)
 │   ├── constants591.py         # Vendored region/section/kind ID maps
 │   ├── ingestion.py             # Ingestion combining mcp-591 & 591scraper
+│   ├── refresh_age.py           # 591 age-text parser (stdlib-only; relay import graph stays light)
 │   ├── deduplication.py         # Multi-image DINO group cosine similarity
-│   ├── visual_preference.py     # Layer 1: liked centroid / Ridge probe -> dino_visual_score
-│   ├── vision_llm.py            # Qwen 27B (Ollama) wrapper & JSON parser
+│   ├── visual_preference.py     # Layer 1: liked centroid / Ridge probe -> dino_visual_score (cross-fit)
+│   ├── bathroom_detect.py       # Qwen photo classifier -> listing_images.is_bathroom
+│   ├── bathroom_probe.py        # bathroom Ridge probe -> bath_model_score
+│   ├── vision_llm.py            # Qwen3.8 Flash Next (Ollama) wrapper & JSON parser
 │   ├── scoring.py               # Layer 3: fusion vector builder, router & XGBoost head
 │   ├── notifier.py              # ntfy.sh HTTP webhook publisher
 │   └── dynamic_prompt.py        # Preference summarizer & prompt manager
@@ -539,7 +559,7 @@ When creating the repository, follow this folder layout:
 1. **Query:** Run `ingestion.fetch_raw_listings()` to collect recent active listings.
 2. **Filter Dead Links:** Validate `HTTP 200` status and verify non-expired listing text.
 3. **Deduplicate:** Generate DINOv3 (ViT-B/16) CLS vectors for listing photos from `models/dinov3_cache` (offline after initial pull); evaluate group cosine similarity against SQLite database ($>0.95$ threshold drops listing).
-4. **LLM Inference:** Pass photos and Chinese text to local Qwen 27B Vision API with Base + Dynamic system prompt.
+4. **LLM Inference:** Pass photos and Chinese text to local Qwen3.8 Flash Next Vision API with Base + Dynamic system prompt.
 5. **Predict:** Layer 1 computes `dino_visual_score` (centroid cosine if $\le 20$ ratings exist, Ridge probe if $> 20$); Layer 3 predicts with Qwen direct rating (if $\le 20$ ratings exist) or the XGBoost regressor on the fusion vector (if $> 20$ ratings exist).
 6. **Notify:** If predicted score $\ge 3.5$, trigger `ntfy.sh` push notification with listing URL and warning highlights (score shown to 2 decimals, 3 significant figures).
 7. **Store:** Persist features (`dino_visual_score`, `qwen_score`), warnings, and scores into SQLite `listings` table.

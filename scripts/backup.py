@@ -11,8 +11,8 @@ Usage:
     .venv/bin/python scripts/backup.py --out /some/other/disk
 
 Backups land in data/backups/ (gitignored via data/*): rent591-<ts>.db plus
-models-<ts>.tar.gz (xgboost head + dino probe; NOT models/dinov3_cache/, which
-is re-downloadable and multi-GB).
+models-<ts>.tar.gz (xgboost head + dino probe + bathroom probe; NOT
+models/dinov3_cache/, which is re-downloadable and multi-GB).
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = ROOT / "data" / "apartments.db"
 DEFAULT_OUT = ROOT / "data" / "backups"
-MODEL_FILES = ("xgboost_head.json", "dino_probe.npz")
+# bathroom_probe.npz belongs here: it is the only artifact holding the bathroom
+# probe's geometry, and a restore without it serves bath_model_score=0.0 for every
+# listing while the restored head was fit on real values.
+MODEL_FILES = ("xgboost_head.json", "dino_probe.npz", "bathroom_probe.npz")
 
 
 def backup_db(db_path: Path, out_dir: Path, stamp: str) -> Path:

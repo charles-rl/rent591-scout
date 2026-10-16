@@ -28,33 +28,55 @@ _PROMPT_T = (
 )
 
 
-def detect_chunk(paths: list[str]) -> set[int]:
-    """Indices (within paths) that are bathroom photos; empty set when model says none."""
-    images = [b for b in (vision_llm._image_b64(p) for p in paths) if b]
-    if not images:
-        return set()
+def detect_chunk(paths: list[str]) -> tuple[set[int], set[int]]:
+    """(hits, shown): indices (within paths) of bathroom photos and of photos the model saw.
+
+    `shown` excludes photos whose b64 could not be read inside an otherwise-live
+    chunk -- the model never saw them, so the caller must leave them unlabelled
+    rather than record an authoritative 0.
+
+    Raises when NO image in the chunk could be read, and when the model reply does
+    not carry a `bathroom_indices` list: both are infrastructure/model failures,
+    not a verdict. Returning an empty set there would let the caller record
+    `is_bathroom=0` for every photo -- an authoritative "Qwen says there is no
+    bathroom" -- which then persists (backfill revisits only NULLs) and, under the
+    authority rule in `main.py`, forces bath_model_score to 0.0.
+    """
+    kept = [(i, b) for i, b in ((i, vision_llm._image_b64(p)) for i, p in enumerate(paths)) if b]
+    if not kept:
+        raise ValueError(f"none of {len(paths)} chunk photos could be read as images")
+    images = [b for _, b in kept]
+    # The model is shown `images` only, so its indices are positions within `kept`,
+    # NOT within `paths`. Map them back through the filter or a dead leading photo
+    # shifts every label onto the wrong ordinal.
+    kept_positions = [i for i, _ in kept]
     messages = [
         {"role": "system", "content": _SYSTEM},
         {"role": "user", "content": _PROMPT_T.format(n=len(images)), "images": images},
     ]
     data = vision_llm.parse_json(vision_llm.ask_ollama(messages, timeout=BATH_DETECT_TIMEOUT))
+    if not isinstance(data, dict) or not isinstance(data.get("bathroom_indices"), list):
+        raise ValueError(  # noqa: TRY004 - the "type" is the LLM reply's JSON shape, not a caller argument
+            f"model reply did not contain a bathroom_indices list: {data!r}")
     out: set[int] = set()
-    if isinstance(data, dict):
-        for i in data.get("bathroom_indices") or []:
-            try:
-                n = int(i)
-            except (TypeError, ValueError):
-                continue
-            if 0 <= n < len(paths):
-                out.add(n)
-    return out
+    for i in data["bathroom_indices"]:
+        try:
+            n = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= n < len(kept_positions):
+            out.add(kept_positions[n])
+    return out, set(kept_positions)
 
 
 def detect_flags(image_paths: list[str | None], chunk: int | None = None) -> dict[int, int] | None:
     """{index: 1|0} over positions in image_paths; None when every chunk failed.
 
-    Chunks are independent: a failed chunk only leaves its photos unlabeled (absent
-    from the dict), never tainting the rest. Callers persist what they get.
+    Chunks are independent: a failed chunk leaves its photos ABSENT from the dict
+    (unknown -- "detection never ran on these"), never tainting the rest. Photos
+    whose b64 failed inside a live chunk are absent for the same reason (the model
+    never saw them). Callers must treat an absent key as unknown rather than as 0;
+    `main.py` derives that from which positions the dict covers.
     """
     chunk = chunk or BATH_DETECT_CHUNK
     valid = [(i, p) for i, p in enumerate(image_paths) if p]
@@ -63,11 +85,14 @@ def detect_flags(image_paths: list[str | None], chunk: int | None = None) -> dic
     for s in range(0, len(valid), chunk):
         part = valid[s:s + chunk]
         try:
-            hits = detect_chunk([p for _, p in part])
+            hits, shown = detect_chunk([p for _, p in part])
         except Exception as e:
             logger.warning("bathroom detection chunk failed (%d photos): %s", len(part), e)
             continue
         ok = True
         for j, (i, _) in enumerate(part):
-            flags[i] = 1 if j in hits else 0
+            # Photos the model never saw (b64 failure inside a live chunk) stay
+            # absent = unknown; writing 0 here made them permanent "no bathroom".
+            if j in shown:
+                flags[i] = 1 if j in hits else 0
     return flags if ok else None

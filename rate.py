@@ -45,6 +45,17 @@ def main() -> None:
             print("XGBoost model head retrained.")
         except Exception as e:
             print(f"Retrain skipped: {e}")
+            conn.close()
+            return
+        try:
+            # Rescore + run the collapse guard: without this every persisted
+            # predicted_score would still come from the PREVIOUS head, and the
+            # guard (only reachable from score_all_unrated) would never fire on
+            # this path -- the one retrain that runs unattended.
+            n = scoring.score_all_unrated(conn)
+            print(f"Rescored {n} unrated listings against the new head.")
+        except Exception as e:
+            print(f"Rescore skipped (head was retrained): {e}")
     conn.close()
 
 

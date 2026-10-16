@@ -15,7 +15,7 @@ Google side uses `google-api-python-client` + `google-auth-oauthlib`.
 |---|---|---|
 | SQLite DB | `data/apartments.db` | Consistent, non-blocking copy via the SQLite **online-backup API** — the running scraper is never locked or interrupted. Validated with `PRAGMA quick_check`. |
 | Listing images | `data/images/**` | All scraped `.webp` (stored uncompressed in the zip). Disable with `--no-images`. |
-| Model weights | `models/xgboost_head.json`, `models/dino_probe.npz` | Included when present. The multi-GB `models/dinov3_cache/` is excluded (re-downloadable). |
+| Model weights | `models/xgboost_head.json`, `models/dino_probe.npz`, `models/bathroom_probe.npz` | Included when present. The multi-GB `models/dinov3_cache/` is excluded (re-downloadable). |
 | Docs & config | `docs/591research.md`, `README.md`, `AGENTS.md`, `pyproject.toml`, `scripts/systemd/*` | Config is env-var driven, so the systemd units + docs are bundled to capture it. |
 
 The resulting archive is named `591_scout_backup_YYYYMMDD_HHMMSS.zip` (UTC).
@@ -180,7 +180,11 @@ What each phase does:
 - **restore** — downloads the newest full (image) zip, installs
   `data/apartments.db` + `data/images/`, and rewrites every stored image path
   (stored absolute on the machine that made the backup) to this machine's
-  location. Refuses to clobber an existing DB unless `--force`.
+  location. Refuses to clobber an existing DB unless `--force`. The bundled
+  `models/*` are NOT installed: they are retrainable from the restored DB and
+  auto-train on the first scored listing (the stamping in
+  `scoring._head_is_stale` makes a restored-but-mismatched head retrain instead
+  of serving mismatched geometry).
 - **clean** — deletes duplicate listings (`is_duplicate=1`) and imageless
   listings (no `listing_images` rows, no CDN source urls, and not `pending`),
   plus their orphaned image files on disk.

@@ -4,11 +4,12 @@ import io
 import json
 from typing import ClassVar
 
+import numpy as np
 import pytest
 from PIL import Image
 
 import main
-from src import database, ingestion
+from src import bathroom_probe, database, ingestion
 
 PROXY = "http://127.0.0.1:8999"
 VISION_OK = {
@@ -347,3 +348,157 @@ def test_completed_but_unscored_is_retried_next_run(env):
     finally:
         conn.close()
     assert len(imgs) == 1 and imgs[0]["image_path"]
+
+
+
+# ---------------------------------------------------------------------------
+# Bathroom authority on the live path (index alignment + partial-detection handling)
+# ---------------------------------------------------------------------------
+
+def _bath_axis(*idx):
+    v = np.zeros(768, dtype=np.float32)
+    for i in idx:
+        v[i] = 1.0
+    return v / np.linalg.norm(v)
+
+
+def _seed_bath_labels(env):
+    """Give the test DB a trained bathroom probe + a bath centroid.
+
+    `predict_listing` returns 0.0 whenever `train_if_stale` has nothing to train on,
+    so without these rows every assertion below would pass vacuously at 0.0.
+    """
+    good, bad = _bath_axis(0, 1, 2), _bath_axis(30, 31, 32)
+    rng = np.random.default_rng(3)
+    conn = database.connect(env["db_path"])
+    try:
+        for i in range(12):
+            lid = f"SEED{i}"
+            is_bath = i % 2 == 0
+            database.upsert_listing(conn, {"listing_id": lid, "title": lid, "price": 12000})
+            database.rate_listing(conn, lid, 4.0, 5.0 if is_bath else 1.0)
+            vec = good if is_bath else bad
+            vec = vec + rng.standard_normal(768).astype(np.float32) * 0.05
+            database.replace_images(conn, lid, [{
+                "ordinal": 0, "image_url": "u", "image_path": f"/p/{lid}_0",
+                "is_bathroom": 1,
+                "dino_embedding": (vec / np.linalg.norm(vec)).astype(np.float32).tobytes(),
+            }])
+    finally:
+        conn.close()
+    assert bathroom_probe.bath_centroid(database.connect(env["db_path"])) is not None
+
+
+def _ingest(env, lid, n_photos):
+    urls = [f"https://img/{i}.jpg" for i in range(n_photos)]
+    _write_payload(env["incoming"], lid, urls)
+    env["monkeypatch"].setattr(main.vision_llm, "analyze_listing",
+                               lambda listing, image_rows, bullets: dict(VISION_OK))
+    env["monkeypatch"].setattr(main.scoring, "RATED_THRESHOLD", 99)  # keep Qwen scoring
+    assert main.run_incoming(env["incoming"], -1, do_notify=False) == 0
+    _seed_bath_labels(env)
+    return [{"ordinal": i, "image_url": f"u{i}", "image_path": f"/p/{lid}_{i}"}
+            for i in range(n_photos)]
+
+
+def _finalize(env, lid, image_rows, bath_flags, new_vecs):
+    mp = env["monkeypatch"]
+    mp.setattr(main.deduplication, "embed_image_rows", lambda rows: dict(new_vecs))
+    mp.setattr(main.deduplication, "find_duplicate", lambda vecs, baseline, thr: (False, None))
+    mp.setattr(main.bathroom_detect, "detect_flags", lambda paths, chunk=None: bath_flags)
+    conn = database.connect(env["db_path"])
+    try:
+        row = conn.execute("SELECT * FROM listings WHERE listing_id=?", (lid,)).fetchone()
+        assert row is not None, f"{lid} was not ingested"
+        main.finalize_listing(
+            conn, main._listing_from_row(row), image_rows, {}, [], False, proxy=None)
+        got = conn.execute(
+            "SELECT bath_model_score FROM listings WHERE listing_id=?", (lid,)).fetchone()[0]
+    finally:
+        conn.close()
+    return got
+
+
+def test_finalize_scores_the_confirmed_bathroom_after_a_dropped_embedding(env):
+    """Ordinal 1 is the bathroom, but its embedding FAILED; ordinal 2 survived.
+
+    embed_image_rows() keys by ordinal and omits failed rows, so position i in its
+    output is NOT position i in image_rows. A stale index-blind implementation would
+    score ordinal 2's vector (the bedroom) and still return a plausible number, so
+    both directions are pinned here.
+    """
+    lid = "9101"
+    rows = _ingest(env, lid, 3)
+    bedroom = _bath_axis(600, 601, 602)          # far from the bath centroid
+    vec0 = _bath_axis(0, 1, 2)                   # looks like a bathroom
+    new_vecs = {0: vec0, 2: bedroom}             # ordinal 1's embedding is missing
+
+    # Ordinal 1 is the confirmed bathroom but has no vector, so `confirmed_bath` ends
+    # up empty and nothing is scored: the flag and its vector are dropped TOGETHER.
+    assert _finalize(env, lid, rows, {0: 0, 1: 1, 2: 0}, new_vecs) == 0.0
+    # Flagging ordinal 2 scores ordinal 2's (bedroom) vector, which the probe rates
+    # low; flagging ordinal 0 scores ordinal 0's (bathroom) vector, which it rates
+    # high. An index-blind implementation that ignored the ordinal map would swap
+    # these two, so the ORDER of the two scores is the actual regression guard.
+    scored_ordinal_2 = _finalize(env, lid, rows, {0: 0, 1: 0, 2: 1}, new_vecs)
+    scored_ordinal_0 = _finalize(env, lid, rows, {0: 1, 1: 0, 2: 0}, new_vecs)
+    assert scored_ordinal_0 > scored_ordinal_2, (
+        f"ordinal 0 (bathroom-like) scored {scored_ordinal_0:.3f} but ordinal 2 "
+        f"(bedroom-like) scored {scored_ordinal_2:.3f} -- indices are misaligned")
+
+
+def test_finalize_falls_back_to_centroid_when_a_chunk_failed(env):
+    """A timed-out chunk leaves positions ABSENT from bath_flags -- unknown, not 0.
+
+    Passing photo_indices=[] in that state both excluded the surviving photos and
+    disabled the centroid, so a real bathroom in the untried chunk scored 0.0.
+    """
+    lid = "9102"
+    rows = _ingest(env, lid, 2)
+    vec0 = _bath_axis(0, 1, 2)                   # bathroom-like
+    vec1 = _bath_axis(600, 601, 602)             # bedroom-like
+    new_vecs = {0: vec0, 1: vec1}
+
+    # complete detection, nothing is a bathroom -> authoritative 0.0
+    assert _finalize(env, lid, rows, {0: 0, 1: 0}, new_vecs) == 0.0
+    # ordinal 1's chunk failed -> position 1 is ABSENT -> centroid must stay eligible,
+    # and it selects ordinal 0 (bathroom-like) for a non-zero score
+    assert _finalize(env, lid, rows, {0: 1}, new_vecs) > 0.0
+    # complete detection that found one -> authoritative; the probe is applied to
+    # exactly the flagged photo, so the score comes from vec1, not the centroid pick
+    assert _finalize(env, lid, rows, {0: 0, 1: 1}, new_vecs) > 0.0
+    # ...and the centroid alone would have picked ordinal 0 instead (see the partial case)
+    assert _finalize(env, lid, rows, {0: 1}, new_vecs) > 0.0
+
+
+def test_finalize_keeps_stored_labels_authoritative_when_detection_is_skipped(env):
+    """scripts/backfill_vision.py re-finalizes with detect_flags -> None while feeding
+    the STORED labels on the rows.
+
+    Coverage must be decided from the labels themselves, not from whether detection
+    ran this round: requiring `bath_flags is not None` made every backfill pass
+    re-score Qwen's verdicts through the centroid and overwrite them.
+    """
+    lid = "9103"
+    rows = _ingest(env, lid, 2)
+    bath_like = _bath_axis(0, 1, 2)
+    bedroom_like = _bath_axis(600, 601, 602)
+    new_vecs = {0: bath_like, 1: bedroom_like}
+
+    # Stored labels name ordinal 0 -> the bathroom-like vector is scored
+    for r, lab in zip(rows, [1, 0]):
+        r["is_bathroom"] = lab
+    scored_stored = _finalize(env, lid, rows, None, new_vecs)
+    # Stored labels name ordinal 1 -> the bedroom-like vector is scored instead.
+    # A centroid-only path cannot produce this order (it always picks bath_like).
+    for r, lab in zip(rows, [0, 1]):
+        r["is_bathroom"] = lab
+    scored_swapped = _finalize(env, lid, rows, None, new_vecs)
+    assert scored_stored > scored_swapped, (
+        f"stored labels were not authoritative: {scored_stored:.3f} vs {scored_swapped:.3f}; "
+        "detection=None must not fall back to the centroid when every photo is labelled")
+
+    # A PARTIAL label set (some NULL) is unknown coverage -> the centroid stays eligible
+    for r, lab in zip(rows, [1, None]):
+        r["is_bathroom"] = lab
+    assert _finalize(env, lid, rows, None, new_vecs) > 0.0

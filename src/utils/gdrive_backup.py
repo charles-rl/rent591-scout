@@ -65,10 +65,13 @@ DEFAULT_KEEP_FULL = 14    # 14 daily full zips
 
 # Small companion files bundled into the zip (relative to ROOT). models/ holds
 # the retrainable heads; the multi-GB dinov3_cache is deliberately excluded
-# (re-downloadable) but the two trained artifacts are included.
+# (re-downloadable) but the three trained artifacts are included -- the bathroom
+# probe is not re-derivable from anything else in the zip (it pools labelled
+# photo embeddings) and without it bath_model_score collapses to 0.0 everywhere.
 COMPANION_FILES = (
     "models/xgboost_head.json",
     "models/dino_probe.npz",
+    "models/bathroom_probe.npz",
     "docs/591research.md",
     "README.md",
     "pyproject.toml",
